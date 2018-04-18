@@ -1,0 +1,24 @@
+apiVersion: extensions/v1beta1
+kind: Deployment
+metadata:
+  name: nginx-reject
+  labels:
+    app: reject
+  namespace: p-demo
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: reject
+  template:
+    metadata:
+      labels:
+        app: reject
+    spec:
+      containers:
+      - name: nginx-reject
+        image: nginx
+        imagePullPolicy: IfNotPresent
+        ports:
+        - containerPort: 80
+          protocol: TCP

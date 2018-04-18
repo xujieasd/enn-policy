@@ -1,0 +1,24 @@
+apiVersion: extensions/v1beta1
+kind: Deployment
+metadata:
+  name: nginx-access
+  labels:
+    app: access
+  namespace: p-demo
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: access
+  template:
+    metadata:
+      labels:
+        app: access
+    spec:
+      containers:
+      - name: nginx-access
+        image: nginx
+        imagePullPolicy: IfNotPresent
+        ports:
+        - containerPort: 80
+          protocol: TCP
