@@ -936,8 +936,8 @@ func (policy *EnnPolicy) syncEgressRule(networkPolicy *utilpolicy.NetworkPolicyI
 
 	// create iptables egress policy rule for different namespace, like
 	// iptables -t filter -N ENN-EGRESS-xxxxxx
-	// iptables -t filter -A ENN-FORWARD -m set --match-set [namespaceIPSet] dst -j ENN-EGRESS-xxxxxx
-	// iptables -t filter -A ENN-OUTPUT -m set --match-set [namespaceIPSet] dst -j ENN-EGRESS-xxxxxx
+	// iptables -t filter -A ENN-FORWARD -m set --match-set [namespaceIPSet] src -j ENN-EGRESS-xxxxxx
+	// iptables -t filter -A ENN-OUTPUT -m set --match-set [namespaceIPSet] src -j ENN-EGRESS-xxxxxx
 	namespaceEgressChainName := ennNamespaceEgressChainName(networkPolicy.Namespace)
 	chainName := utiliptables.Chain(namespaceEgressChainName)
 	if chain, ok := policy.existingFilterChains[chainName]; ok {
@@ -954,13 +954,13 @@ func (policy *EnnPolicy) syncEgressRule(networkPolicy *utilpolicy.NetworkPolicyI
 		comment := fmt.Sprintf(`"ingress entry for namespace/%s"`, networkPolicy.Namespace)
 		args = []string{
 			"-A", string(ENN_FORWARD_CHAIN),
-			"-m", "set", "--match-set", namespacePodSetName, "dst",
+			"-m", "set", "--match-set", namespacePodSetName, "src",
 			"-m", "comment", "--comment", comment,
 		}
 		writeLine(policy.filterRules, append(args, "-j", namespaceEgressChainName)...)
 		args = []string{
 			"-A", string(ENN_OUTPUT_CHAIN),
-			"-m", "set", "--match-set", namespacePodSetName, "dst",
+			"-m", "set", "--match-set", namespacePodSetName, "src",
 			"-m", "comment", "--comment", comment,
 		}
 		writeLine(policy.filterRules, append(args, "-j", namespaceEgressChainName)...)
@@ -998,7 +998,7 @@ func (policy *EnnPolicy) syncEgressRule(networkPolicy *utilpolicy.NetworkPolicyI
 			iPRangeName := ennIPRangeIPSetName(policy.iPRange)
 			args = []string{
 				"-A", namespaceEgressChainName,
-				"-m", "set", "--match-set", iPRangeName, "src",
+				"-m", "set", "--match-set", iPRangeName, "dst",
 				"-m", "comment", "--comment", comment,
 			}
 			writeLine(policy.filterRules, append(args, "-j", iPRangeEgressChainName)...)
