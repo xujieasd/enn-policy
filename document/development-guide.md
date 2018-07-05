@@ -10,7 +10,7 @@
 
 ### How to build
 
-* git clone https://10.19.248.12:30888/xujieasd/enn-policy
+* git clone https://github.com/xujieasd/enn-policy.git
 * make
 
 ### How to build image
