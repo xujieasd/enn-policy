@@ -11,12 +11,14 @@ import (
 	k8sIPTables "enn-policy/pkg/util/k8siptables"
 	utildbus "enn-policy/pkg/util/dbus"
 
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/intstr"
 	"testing"
 
 	"strings"
 	"bytes"
 	//"strconv"
+	"fmt"
 	"strconv"
 )
 
@@ -65,6 +67,7 @@ var networkPolicies = []*api.NetworkPolicy{
 				From: []api.NetworkPolicyPeer{{
 					IPBlock: &api.IPBlock{
 						CIDR: "172.10.0.0/16",
+						Except: []string{"172.10.3.0/24","172.10.4.0/24"},
 					},
 				}},
 			},
@@ -231,6 +234,9 @@ func NewFakeEnnPolicy(ipRange string) *EnnPolicy{
 		hostName:                "",
 		clusterCIDR:             "",
 		iPRange:                 ipRange,
+		acceptFlannel:           false,
+		flannelNet:              "0.0.0.0/0",
+		flannelLen:              8,
 		networkPolicySynced:     true,
 		podSynced:               true,
 		namespaceSynced:         true,
@@ -248,6 +254,8 @@ func NewFakeEnnPolicy(ipRange string) *EnnPolicy{
 		namespacePodMap:         make(utilpolicy.NamespacePodMap),
 		namespaceInfoMap:        make(utilpolicy.NamespaceInfoMap),
 		activeIPSets:            make(map[string]*utilIPSet.IPSet),
+		podXLabelMap:            make(map[types.NamespacedName]*utilpolicy.NamespacedLabelMap),
+		podXLabelSet:            make(map[types.NamespacedName]*utilIPSet.IPSet),
 		podLabelSet:             make(map[utilpolicy.NamespacedLabel]*utilIPSet.IPSet),
 		namespacePodLabelSet:    make(map[utilpolicy.Label]*utilIPSet.IPSet),
 		namespacePodSet:         make(map[string]*utilIPSet.IPSet),
@@ -263,6 +271,60 @@ func NewFakeEnnPolicy(ipRange string) *EnnPolicy{
 	return &ennpolicy
 }
 
+// test whether IPRange IPSet entry is correct, ipRange should not be 0.0.0.0/0
+func TestIPRangeSet(t *testing.T){
+
+	fnp := NewFakeEnnPolicy("10.244.0.0/16")
+
+	// first time sync will add entry to ipset
+	fnp.syncEnnPolicy(SYNCALL)
+	ok := checkIPRangeIPSet(t, fnp, "10.244.0.0/16", "10.244.0.0/16")
+	if !ok{
+		t.Errorf("check ipRange %s IPSet fail", "10.244.0.0/16")
+	}
+
+	// second time sync no more entry will be added
+	fnp.syncEnnPolicy(SYNCALL)
+	ok = checkIPRangeIPSet(t, fnp, "10.244.0.0/16", "10.244.0.0/16")
+	if !ok{
+		t.Errorf("check ipRange %s IPSet fail", "10.244.0.0/16")
+	}
+}
+
+// test whether FlannelNet IPSet entry is correct, acceptFlannel should be true
+func TestFlannelNetSet(t *testing.T){
+
+	fnp := NewFakeEnnPolicy("10.244.0.0/16")
+	fnp.acceptFlannel = true
+	fnp.flannelNet = "172.16.0.0/12"
+	fnp.flannelLen = 8
+
+	// build expected flannelNet ip map
+	expectedMap := make(map[string]bool)
+
+	for a2 := 16; a2 < 32; a2 ++{
+		for a1 := 0; a1 < 256; a1 = a1 + 16{
+			flannelIp := fmt.Sprintf("172.%d.%d.0",a2,a1)
+			dockerIp := fmt.Sprintf("172.%d.%d.1",a2,a1)
+			expectedMap[flannelIp] = true
+			expectedMap[dockerIp] = true
+		}
+	}
+
+	// first time sync will add entry to ipset
+	fnp.syncEnnPolicy(SYNCALL)
+	ok := checkFlannelNetIPSet(t, fnp, "172.16.0.0/12", "8", expectedMap)
+	if !ok{
+		t.Errorf("check FlannelNet %s IPSet fail", "172.16.0.0/12")
+	}
+
+	// second time sync no more entry will be added
+	fnp.syncEnnPolicy(SYNCALL)
+	ok = checkFlannelNetIPSet(t, fnp, "172.16.0.0/12", "8", expectedMap)
+	if !ok{
+		t.Errorf("check FlannelNet %s IPSet fail", "172.16.0.0/12")
+	}
+}
 
 // test ingress rules for podSelector
 // will only test iptables rules
@@ -312,6 +374,9 @@ func TestNetworkPolicyAddIngressPodSelector(t *testing.T){
 func TestNetworkPolicyAddIngressNamespaceSelector(t *testing.T){
 
 	fnp := NewFakeEnnPolicy("0.0.0.0/0")
+	fnp.acceptFlannel = true
+	fnp.flannelNet = "172.16.0.0/12"
+	fnp.flannelLen = 8
 
 	fnp.OnNetworkPolicyAdd(networkPolicies[1])
 
@@ -339,8 +404,8 @@ func TestNetworkPolicyAddIngressNamespaceSelector(t *testing.T){
 		lists[1],
 		networkPolicies[1].Namespace,
 		"ingress",
-		"run1",
-		"test1",
+		"",
+		"",
 		"ns1",
 		"ns1",
 	)
@@ -378,12 +443,16 @@ func TestNetworkPolicyAddIngressIPBlock(t *testing.T){
 
 	ok = checkDispatchChainIPBlock(
 		t,
+		fnp,
 		lists[1],
 		networkPolicies[2].Namespace,
 		"ingress",
 		"",
 		"",
-		"172.10.0.0/16",
+		utilpolicy.CIDRRange{
+			CIDR:       "172.10.0.0/16",
+			ExceptCIDR: []string{"172.10.3.0/24","172.10.4.0/24"},
+		},
 	)
 
 	if !ok{
@@ -396,6 +465,9 @@ func TestNetworkPolicyAddIngressIPBlock(t *testing.T){
 func TestNetworkPolicyAddIngressPort(t *testing.T){
 
 	fnp := NewFakeEnnPolicy("10.244.0.0/16")
+	fnp.acceptFlannel = true
+	fnp.flannelNet = "172.16.0.0/12"
+	fnp.flannelLen = 8
 
 	fnp.OnNetworkPolicyAdd(networkPolicies[3])
 
@@ -515,6 +587,9 @@ func TestNetworkPolicyAddEgressPodSelector(t *testing.T){
 func TestNetworkPolicyAddEgressNamespaceSelector(t *testing.T){
 
 	fnp := NewFakeEnnPolicy("10.244.0.0/16")
+	fnp.acceptFlannel = true
+	fnp.flannelNet = "172.16.0.0/12"
+	fnp.flannelLen = 8
 
 	fnp.OnNetworkPolicyAdd(networkPolicies[5])
 
@@ -544,38 +619,22 @@ func TestNetworkPolicyAddEgressNamespaceSelector(t *testing.T){
 			// -A ENN-PLY-E-FLYGA4ITYZL5AVLH -m comment --comment "entry for namespaceSelector" -j ENN-DPATCH-ZYW3R7UAHYFD5CLT
 			lists, _ := fnp.iptablesInterface.List(FILTER_TABLE, entry)
 
-			if len(lists) != 3{
-				t.Errorf("Add Egress NamespaceSelector: dispatch entry len is %d, expected 3, entry: %s", len(lists), entry)
+			if len(lists) != 2{
+				t.Errorf("Add Egress NamespaceSelector: dispatch entry len is %d, expected 2, entry: %s", len(lists), entry)
 				return
 			}
 
 			for _, list := range lists{
-				if strings.Contains(list, "run1=test1"){
-					// -A ENN-DPATCH-ZYW3R7UAHYFD5CLT -m comment --comment "accept rule selected by policy namespace2/np5: src match run1=test1, dst namespace match ns2=ns2"
+				if strings.Contains(list, "n2=n2"){
+					// -A ENN-DPATCH-ZYW3R7UAHYFD5CLT -m comment --comment "accept rule selected by policy namespace2/np5: src match policy spec podSelector, dst namespace match ns2=ns2"
 					// -m set --match-set ENN-PODSET-3WH7O4RMU7J5Q4P4 src -m set --match-set ENN-NSSET-2DX3JVYC4LR6FVW3 dst -j ACCEPT
 					ok = checkDispatchChainNamespaceSelector(
 						t,
 						list,
 						networkPolicies[5].Namespace,
 						"egress",
-						"run1",
-						"test1",
-						"ns2",
-						"ns2",
-					)
-					if !ok{
-						t.Errorf("Add Egress NamespaceSelector: check dispatch error")
-					}
-				} else if strings.Contains(list, "run2=test2"){
-					// -A ENN-DPATCH-ZYW3R7UAHYFD5CLT -m comment --comment "accept rule selected by policy namespace2/np5: src match run2=test2, dst namespace match ns2=ns2"
-					// -m set --match-set ENN-PODSET-IXGJO7JWEV77LVL5 src -m set --match-set ENN-NSSET-2DX3JVYC4LR6FVW3 dst -j ACCEPT
-					ok = checkDispatchChainNamespaceSelector(
-						t,
-						list,
-						networkPolicies[5].Namespace,
-						"egress",
-						"run2",
-						"test2",
+						"",
+						"",
 						"ns2",
 						"ns2",
 					)
@@ -594,38 +653,22 @@ func TestNetworkPolicyAddEgressNamespaceSelector(t *testing.T){
 			// -A ENN-PLY-E-FLYGA4ITYZL5AVLH -m comment --comment "entry for namespaceSelector" -j ENN-DPATCH-2VR6PQKQMSWHOHWA
 			lists, _ := fnp.iptablesInterface.List(FILTER_TABLE, entry)
 
-			if len(lists) != 3{
-				t.Errorf("Add Egress NamespaceSelector: dispatch entry len is %d, expected 3, entry: %s", len(lists), entry)
+			if len(lists) != 2{
+				t.Errorf("Add Egress NamespaceSelector: dispatch entry len is %d, expected 2, entry: %s", len(lists), entry)
 				return
 			}
 
 			for _, list := range lists{
-				if strings.Contains(list, "run1=test1"){
-					// -A ENN-DPATCH-2VR6PQKQMSWHOHWA -m comment --comment "accept rule selected by policy namespace2/np5: src match run1=test1,
+				if strings.Contains(list, "n3=n3"){
+					// -A ENN-DPATCH-2VR6PQKQMSWHOHWA -m comment --comment "accept rule selected by policy namespace2/np5: src match policy spec podSelector,
 					// dst namespace match ns3=ns3" -m set --match-set ENN-PODSET-3WH7O4RMU7J5Q4P4 src -m set --match-set ENN-NSSET-BMTEHLTEP3GJQJC7 dst -j ACCEPT
 					ok = checkDispatchChainNamespaceSelector(
 						t,
 						list,
 						networkPolicies[5].Namespace,
 						"egress",
-						"run1",
-						"test1",
-						"ns3",
-						"ns3",
-					)
-					if !ok{
-						t.Errorf("Add Egress NamespaceSelector: check dispatch error")
-					}
-				} else if strings.Contains(list, "run2=test2"){
-					// -A ENN-DPATCH-2VR6PQKQMSWHOHWA -m comment --comment "accept rule selected by policy namespace2/np5: src match run2=test2,
-					// dst namespace match ns3=ns3" -m set --match-set ENN-PODSET-IXGJO7JWEV77LVL5 src -m set --match-set ENN-NSSET-BMTEHLTEP3GJQJC7 dst -j ACCEPT
-					ok = checkDispatchChainNamespaceSelector(
-						t,
-						list,
-						networkPolicies[5].Namespace,
-						"egress",
-						"run2",
-						"test2",
+						"",
+						"",
 						"ns3",
 						"ns3",
 					)
@@ -643,12 +686,14 @@ func TestNetworkPolicyAddEgressNamespaceSelector(t *testing.T){
 	}
 }
 
-
 // test egress rules for ipBlock
 // will only test iptables rules
 func TestNetworkPolicyAddEgressIPBlock(t *testing.T){
 
 	fnp := NewFakeEnnPolicy("10.244.0.0/16")
+	fnp.acceptFlannel = true
+	fnp.flannelNet = "172.16.0.0/12"
+	fnp.flannelLen = 8
 
 	fnp.OnNetworkPolicyAdd(networkPolicies[6])
 
@@ -673,12 +718,15 @@ func TestNetworkPolicyAddEgressIPBlock(t *testing.T){
 
 	ok = checkDispatchChainIPBlock(
 		t,
+		fnp,
 		lists[1],
 		networkPolicies[6].Namespace,
 		"egress",
 		"run1",
 		"test1",
-		"198.168.2.0/24",
+		utilpolicy.CIDRRange{
+			CIDR:       "198.168.2.0/24",
+		},
 	)
 
 	if !ok{
@@ -749,6 +797,9 @@ func TestNetworkPolicyAddEgressPort(t *testing.T){
 // 2. delete some networkPolicies in different namespaces, then check whether iptables is correct
 func TestNetworkPolicyAddDelete(t *testing.T){
 	fnp := NewFakeEnnPolicy("10.244.0.0/16")
+	fnp.acceptFlannel = true
+	fnp.flannelNet = "172.16.0.0/12"
+	fnp.flannelLen = 8
 
 	for i := 0; i < 11; i++{
 		fnp.OnNetworkPolicyAdd(networkPolicies[i])
@@ -821,8 +872,8 @@ func TestNetworkPolicyAddDelete(t *testing.T){
 			"",
 			"ns2",
 			"ns2"){
-			if len(lists) != 3 {
-				t.Errorf("Egress: rule number for dispatch entry:%s is not correct: %d, expect %d", entry, len(lists), 3)
+			if len(lists) != 2 {
+				t.Errorf("Egress: rule number for dispatch entry:%s is not correct: %d, expect %d", entry, len(lists), 2)
 			}
 
 		} else if entry == ennDispatchChainName(
@@ -833,8 +884,8 @@ func TestNetworkPolicyAddDelete(t *testing.T){
 			"",
 			"ns3",
 			"ns3"){
-			if len(lists) != 3 {
-				t.Errorf("Egress: rule number for dispatch entry:%s is not correct: %d, expect %d", entry, len(lists), 3)
+			if len(lists) != 2 {
+				t.Errorf("Egress: rule number for dispatch entry:%s is not correct: %d, expect %d", entry, len(lists), 2)
 			}
 
 		} else {
@@ -867,8 +918,8 @@ func TestNetworkPolicyAddDelete(t *testing.T){
 				t.Errorf("Ingress: rule number for dispatch entry:%s is not correct: %d, expect %d", entry, len(lists), 2)
 			}
 		} else {
-			if len(lists) != 3 {
-				t.Errorf("Ingress: rule number for dispatch entry:%s is not correct: %d, expect %d", entry, len(lists), 3)
+			if len(lists) != 2 {
+				t.Errorf("Ingress: rule number for dispatch entry:%s is not correct: %d, expect %d", entry, len(lists), 2)
 			}
 		}
 	}
@@ -884,8 +935,8 @@ func TestNetworkPolicyAddDelete(t *testing.T){
 	}
 	for _, entry := range dispatchEntry{
 		lists, _ := fnp.iptablesInterface.List(FILTER_TABLE, entry)
-		if len(lists) != 3 {
-			t.Errorf("Ingress: rule number for dispatch entry:%s is not correct: %d, expect %d", entry, len(lists), 3)
+		if len(lists) != 2 {
+			t.Errorf("Ingress: rule number for dispatch entry:%s is not correct: %d, expect %d", entry, len(lists), 2)
 		}
 	}
 
@@ -930,6 +981,9 @@ func TestNetworkPolicyAddDelete(t *testing.T){
 func TestNetworkPolicyUpdate(t *testing.T){
 
 	fnp := NewFakeEnnPolicy("10.244.0.0/16")
+	fnp.acceptFlannel = true
+	fnp.flannelNet = "172.16.0.0/12"
+	fnp.flannelLen = 8
 
 	fnp.OnNetworkPolicyAdd(networkPolicies[10])
 
@@ -943,8 +997,8 @@ func TestNetworkPolicyUpdate(t *testing.T){
 	}
 	for _, entry := range dispatchEntry{
 		lists, _ := fnp.iptablesInterface.List(FILTER_TABLE, entry)
-		if len(lists) != 3 {
-			t.Errorf("Ingress: rule number for dispatch entry:%s is not correct: %d, expect %d", entry, len(lists), 3)
+		if len(lists) != 2 {
+			t.Errorf("Ingress: rule number for dispatch entry:%s is not correct: %d, expect %d", entry, len(lists), 2)
 		}
 	}
 
@@ -961,8 +1015,8 @@ func TestNetworkPolicyUpdate(t *testing.T){
 	}
 	for _, entry := range dispatchEntry{
 		lists, _ := fnp.iptablesInterface.List(FILTER_TABLE, entry)
-		if len(lists) != 3 {
-			t.Errorf("Ingress: rule number for dispatch entry:%s is not correct: %d, expect %d", entry, len(lists), 3)
+		if len(lists) != 2 {
+			t.Errorf("Ingress: rule number for dispatch entry:%s is not correct: %d, expect %d", entry, len(lists), 2)
 		}
 	}
 
@@ -979,8 +1033,8 @@ func TestNetworkPolicyUpdate(t *testing.T){
 	}
 	for _, entry := range dispatchEntry{
 		lists, _ := fnp.iptablesInterface.List(FILTER_TABLE, entry)
-		if len(lists) != 3 {
-			t.Errorf("Ingress: rule number for dispatch entry:%s is not correct: %d, expect %d", entry, len(lists), 3)
+		if len(lists) != 2 {
+			t.Errorf("Ingress: rule number for dispatch entry:%s is not correct: %d, expect %d", entry, len(lists), 2)
 		}
 	}
 
@@ -997,8 +1051,8 @@ func TestNetworkPolicyUpdate(t *testing.T){
 	}
 	for _, entry := range dispatchEntry{
 		lists, _ := fnp.iptablesInterface.List(FILTER_TABLE, entry)
-		if len(lists) != 3 {
-			t.Errorf("Ingress: rule number for dispatch entry:%s is not correct: %d, expect %d", entry, len(lists), 3)
+		if len(lists) != 2 {
+			t.Errorf("Ingress: rule number for dispatch entry:%s is not correct: %d, expect %d", entry, len(lists), 2)
 		}
 	}
 
@@ -1015,8 +1069,8 @@ func TestNetworkPolicyUpdate(t *testing.T){
 	}
 	for _, entry := range dispatchEntry{
 		lists, _ := fnp.iptablesInterface.List(FILTER_TABLE, entry)
-		if len(lists) != 3 {
-			t.Errorf("Ingress: rule number for dispatch entry:%s is not correct: %d, expect %d", entry, len(lists), 3)
+		if len(lists) != 2 {
+			t.Errorf("Ingress: rule number for dispatch entry:%s is not correct: %d, expect %d", entry, len(lists), 2)
 		}
 		if entry == ennDispatchChainName(
 			networkPolicies[10].Namespace,
@@ -1129,38 +1183,46 @@ func TestPodAdd(t *testing.T){
 		makeTestPod(namespaceName[3], "pod0", func(pod *coreApi.Pod) {
 			pod.Labels = map[string]string{"run1":"test11","run2":"test2"}
 			pod.Status.PodIP = "10.0.0.0"
+			pod.Status.Conditions = []coreApi.PodCondition{{Type: coreApi.PodReady, Status: coreApi.ConditionTrue}}
 		}),
 		// 1 this pod in namespaceLabelSet ns3=ns33
 		makeTestPod(namespaceName[3], "pod1", func(pod *coreApi.Pod) {
 			pod.Labels = map[string]string{"run2":"test2"}
 			pod.Status.PodIP = "10.0.0.1"
+			pod.Status.Conditions = []coreApi.PodCondition{{Type: coreApi.PodReady, Status: coreApi.ConditionTrue}}
 		}),
 		// 2 this pod in podLabelSet namespace[3]:run1=test11 and namespaceLabelSet ns3=ns33
 		makeTestPod(namespaceName[3], "pod2", func(pod *coreApi.Pod) {
 			pod.Labels = map[string]string{"run1":"test11"}
 			pod.Status.PodIP = "10.0.0.2"
+			pod.Status.Conditions = []coreApi.PodCondition{{Type: coreApi.PodReady, Status: coreApi.ConditionTrue}}
 		}),
 		// 3 this pod in namespaceLabelSet ns3=ns33
 		makeTestPod(namespaceName[3], "pod3", func(pod *coreApi.Pod) {
 			pod.Labels = map[string]string{"run1":"test1","run3":"test3"}
 			pod.Status.PodIP = "10.0.0.3"
+			pod.Status.Conditions = []coreApi.PodCondition{{Type: coreApi.PodReady, Status: coreApi.ConditionTrue}}
 		}),
 		// 4 this pod in podLabelSet namespace[3]:run1=test11 and namespaceLabelSet ns3=ns33
 		makeTestPod(namespaceName[3], "pod4", func(pod *coreApi.Pod) {
 			pod.Labels = map[string]string{"run1":"test11","run3":"test3"}
 			pod.Status.PodIP = "10.0.0.4"
+			pod.Status.Conditions = []coreApi.PodCondition{{Type: coreApi.PodReady, Status: coreApi.ConditionTrue}}
 		}),
 		// 5 this pod in namespaceLabelSet ns3=ns33
 		makeTestPod(namespaceName[4], "pod5", func(pod *coreApi.Pod) {
 			pod.Status.PodIP = "10.0.0.5"
+			pod.Status.Conditions = []coreApi.PodCondition{{Type: coreApi.PodReady, Status: coreApi.ConditionTrue}}
 		}),
 		// 6 this pod in namespaceLabelSet ns3=ns33
 		makeTestPod(namespaceName[4], "pod6", func(pod *coreApi.Pod) {
 			pod.Status.PodIP = "10.0.0.6"
+			pod.Status.Conditions = []coreApi.PodCondition{{Type: coreApi.PodReady, Status: coreApi.ConditionTrue}}
 		}),
 		// 7 this pod none of the set
 		makeTestPod(namespaceName[2], "pod7", func(pod *coreApi.Pod) {
 			pod.Status.PodIP = "10.0.0.7"
+			pod.Status.Conditions = []coreApi.PodCondition{{Type: coreApi.PodReady, Status: coreApi.ConditionTrue}}
 		}),
 	}
 
@@ -1177,17 +1239,24 @@ func TestPodAdd(t *testing.T){
 	// NamespaceSelector: map[string]string{"ns3":"ns33"}
 	fnp.OnNetworkPolicyAdd(networkPolicies[9])
 
-	ok := checkIPRangeIPSet(t, fnp, "10.244.0.0/16", "10.244.0.0/16")
-	if !ok{
-		t.Errorf("check ipRange %s IPSet fail", "10.244.0.0/16")
-	}
-	ok = checkNamespacePodIPSet(t, fnp, namespaceName[3], "10.0.0.0", "10.0.0.1")
+	xLabel := make(map[string]string)
+	xLabel["run1"] = "test11"
+
+	//ok := checkIPRangeIPSet(t, fnp, "10.244.0.0/16", "10.244.0.0/16")
+	//if !ok{
+	//	t.Errorf("check ipRange %s IPSet fail", "10.244.0.0/16")
+	//}
+	ok := checkNamespacePodIPSet(t, fnp, namespaceName[3], "10.0.0.0", "10.0.0.1")
 	if !ok{
 		t.Errorf("check namespace %s IPSet fail", namespaceName[3])
 	}
 	ok = checkPodLabelIPSet(t, fnp, namespaceName[3], "run1", "test11", "10.0.0.0")
 	if !ok{
 		t.Errorf("check pod label set %s:%s=%s IPSet fail", namespaceName[3],"run1","test11")
+	}
+	ok = checkPodXLabelIPSet(t, fnp, namespaceName[3], xLabel, "10.0.0.0")
+	if !ok{
+		t.Errorf("check pod xLabel set namespace:%s, label:%v IPSet fail", namespaceName[3],xLabel)
 	}
 	ok = checkNamespaceLabelIPSet(t, fnp, "ns3", "ns33", "10.0.0.0", "10.0.0.1")
 	if !ok{
@@ -1208,6 +1277,10 @@ func TestPodAdd(t *testing.T){
 		"10.0.0.0", "10.0.0.2", "10.0.0.4")
 	if !ok{
 		t.Errorf("check pod label set %s:%s=%s IPSet fail", namespaceName[3],"run1","test11")
+	}
+	ok = checkPodXLabelIPSet(t, fnp, namespaceName[3], xLabel, "10.0.0.0", "10.0.0.2", "10.0.0.4")
+	if !ok{
+		t.Errorf("check pod xLabel set namespace:%s, label:%v IPSet fail", namespaceName[3],xLabel)
 	}
 	ok = checkNamespaceLabelIPSet(t, fnp, "ns3", "ns33",
 		"10.0.0.0", "10.0.0.1", "10.0.0.2", "10.0.0.3", "10.0.0.4", "10.0.0.5", "10.0.0.6")
@@ -1244,42 +1317,63 @@ func TestPodDelete(t *testing.T){
 		makeTestPod(namespaceName[3], "pod0", func(pod *coreApi.Pod) {
 			pod.Labels = map[string]string{"run1":"test11","run2":"test2"}
 			pod.Status.PodIP = "10.0.0.0"
+			pod.Status.Conditions = []coreApi.PodCondition{{Type: coreApi.PodReady, Status: coreApi.ConditionTrue}}
 		}),
 		// 1 this pod in podLabelSet namespace[3]:run2=test2 and namespaceLabelSet ns2=ns2,ns3=ns3
 		makeTestPod(namespaceName[3], "pod1", func(pod *coreApi.Pod) {
 			pod.Labels = map[string]string{"run2":"test2"}
 			pod.Status.PodIP = "10.0.0.1"
+			pod.Status.Conditions = []coreApi.PodCondition{{Type: coreApi.PodReady, Status: coreApi.ConditionTrue}}
 		}),
 		// 2 this pod in podLabelSet namespace[3]:run1=test1 and namespaceLabelSet ns2=ns2,ns3=ns3
 		makeTestPod(namespaceName[3], "pod2", func(pod *coreApi.Pod) {
 			pod.Labels = map[string]string{"run1":"test1"}
 			pod.Status.PodIP = "10.0.0.2"
+			pod.Status.Conditions = []coreApi.PodCondition{{Type: coreApi.PodReady, Status: coreApi.ConditionTrue}}
 		}),
 		// 3 this pod in podLabelSet namespace[3]:run1=test1 and namespaceLabelSet ns2=ns2,ns3=ns3
 		makeTestPod(namespaceName[3], "pod3", func(pod *coreApi.Pod) {
 			pod.Labels = map[string]string{"run1":"test1","run3":"test3"}
 			pod.Status.PodIP = "10.0.0.3"
+			pod.Status.Conditions = []coreApi.PodCondition{{Type: coreApi.PodReady, Status: coreApi.ConditionTrue}}
 		}),
 		// 4 this pod in namespaceLabelSet ns2=ns2,ns3=ns3
 		makeTestPod(namespaceName[3], "pod4", func(pod *coreApi.Pod) {
 			pod.Labels = map[string]string{"run1":"test11","run3":"test3"}
 			pod.Status.PodIP = "10.0.0.4"
+			pod.Status.Conditions = []coreApi.PodCondition{{Type: coreApi.PodReady, Status: coreApi.ConditionTrue}}
 		}),
 		// 5 this pod in namespaceLabelSet ns2=ns22,ns3=ns3
 		makeTestPod(namespaceName[4], "pod5", func(pod *coreApi.Pod) {
 			pod.Status.PodIP = "10.0.0.5"
+			pod.Status.Conditions = []coreApi.PodCondition{{Type: coreApi.PodReady, Status: coreApi.ConditionTrue}}
 		}),
 		// 6 this pod in namespaceLabelSet ns2=ns22,ns3=ns3
 		makeTestPod(namespaceName[4], "pod6", func(pod *coreApi.Pod) {
 			pod.Status.PodIP = "10.0.0.6"
+			pod.Status.Conditions = []coreApi.PodCondition{{Type: coreApi.PodReady, Status: coreApi.ConditionTrue}}
 		}),
 		// 7 this pod in namespaceLabelSet ns2=ns2
 		makeTestPod(namespaceName[2], "pod7", func(pod *coreApi.Pod) {
 			pod.Status.PodIP = "10.0.0.7"
+			pod.Status.Conditions = []coreApi.PodCondition{{Type: coreApi.PodReady, Status: coreApi.ConditionTrue}}
 		}),
 		// 8 this pod in none of set
 		makeTestPod(namespaceName[1], "pod8", func(pod *coreApi.Pod) {
 			pod.Status.PodIP = "10.0.0.8"
+			pod.Status.Conditions = []coreApi.PodCondition{{Type: coreApi.PodReady, Status: coreApi.ConditionTrue}}
+		}),
+		// 9 this pod in podLabelSet namespace[3]:run1=test1,run2=test2 and namespaceLabelSet ns2=ns2,ns3=ns3
+		makeTestPod(namespaceName[3], "pod9", func(pod *coreApi.Pod) {
+			pod.Labels = map[string]string{"run1":"test1","run2":"test2"}
+			pod.Status.PodIP = "10.0.0.9"
+			pod.Status.Conditions = []coreApi.PodCondition{{Type: coreApi.PodReady, Status: coreApi.ConditionTrue}}
+		}),
+		// 10 this pod in podLabelSet namespace[3]:run1=test1,run2=test2 and namespaceLabelSet ns2=ns2,ns3=ns3
+		makeTestPod(namespaceName[3], "pod10", func(pod *coreApi.Pod) {
+			pod.Labels = map[string]string{"run1":"test1","run2":"test2","run3":"test3"}
+			pod.Status.PodIP = "10.0.0.10"
+			pod.Status.Conditions = []coreApi.PodCondition{{Type: coreApi.PodReady, Status: coreApi.ConditionTrue}}
 		}),
 	}
 
@@ -1290,9 +1384,13 @@ func TestPodDelete(t *testing.T){
 	for i := 0; i < 4; i++{
 		fnp.OnNamespaceAdd(namespaces[i])
 	}
-	for i := 0; i < 8; i++{
+	for i := 0; i < 11; i++{
 		fnp.OnPodAdd(pods[i])
 	}
+
+	xLabel := make(map[string]string)
+	xLabel["run1"] = "test1"
+	xLabel["run2"] = "test2"
 	//np.Spec.PodSelector: map[string]string{"run1":"test1","run2":"test2"}}
 	//NamespaceSelector: map[string]string{"ns2":"ns2","ns3":"ns3"}},
 	//NamespaceSelector: map[string]string{"ns2":"ns22"}},
@@ -1300,27 +1398,31 @@ func TestPodDelete(t *testing.T){
 	fnp.OnNetworkPolicyAdd(networkPolicies[8])
 
 	ok := checkNamespacePodIPSet(t, fnp, namespaceName[3],
-		"10.0.0.0", "10.0.0.1", "10.0.0.2", "10.0.0.3", "10.0.0.4")
+		"10.0.0.0", "10.0.0.1", "10.0.0.2", "10.0.0.3", "10.0.0.4", "10.0.0.9", "10.0.0.10")
 	if !ok{
 		t.Errorf("check namespace %s IPSet fail", namespaceName[3])
 	}
 	ok = checkPodLabelIPSet(t, fnp, namespaceName[3], "run1", "test1",
-		"10.0.0.2", "10.0.0.3")
+		"10.0.0.2", "10.0.0.3", "10.0.0.9", "10.0.0.10")
 	if !ok{
 		t.Errorf("check pod label set %s:%s=%s IPSet fail", namespaceName[3],"run1","test1")
 	}
 	ok = checkPodLabelIPSet(t, fnp, namespaceName[3], "run2", "test2",
-		"10.0.0.0", "10.0.0.1")
+		"10.0.0.0", "10.0.0.1", "10.0.0.9", "10.0.0.10")
 	if !ok{
 		t.Errorf("check pod label set %s:%s=%s IPSet fail", namespaceName[3],"run2","test2")
 	}
+	ok = checkPodXLabelIPSet(t, fnp, namespaceName[3], xLabel, "10.0.0.9", "10.0.0.10")
+	if !ok{
+		t.Errorf("check pod xLabel set namespace:%s, label:%v IPSet fail", namespaceName[3],xLabel)
+	}
 	ok = checkNamespaceLabelIPSet(t, fnp, "ns2", "ns2",
-		"10.0.0.0", "10.0.0.1", "10.0.0.2", "10.0.0.3", "10.0.0.4", "10.0.0.7")
+		"10.0.0.0", "10.0.0.1", "10.0.0.2", "10.0.0.3", "10.0.0.4", "10.0.0.7", "10.0.0.9", "10.0.0.10")
 	if !ok{
 		t.Errorf("check namespace label set %s=%s IPSet fail", "ns2","ns2")
 	}
 	ok = checkNamespaceLabelIPSet(t, fnp, "ns3", "ns3",
-		"10.0.0.0", "10.0.0.1", "10.0.0.2", "10.0.0.3", "10.0.0.4", "10.0.0.5", "10.0.0.6")
+		"10.0.0.0", "10.0.0.1", "10.0.0.2", "10.0.0.3", "10.0.0.4", "10.0.0.5", "10.0.0.6", "10.0.0.9", "10.0.0.10")
 	if !ok{
 		t.Errorf("check namespace label set %s=%s IPSet fail", "ns3","ns3")
 	}
@@ -1335,29 +1437,34 @@ func TestPodDelete(t *testing.T){
 	fnp.OnPodDelete(pods[2])
 	fnp.OnPodDelete(pods[4])
 	fnp.OnPodDelete(pods[6])
+	fnp.OnPodDelete(pods[9])
 
 	ok = checkNamespacePodIPSet(t, fnp, namespaceName[3],
-		"10.0.0.1", "10.0.0.3")
+		"10.0.0.1", "10.0.0.3", "10.0.0.10")
 	if !ok{
 		t.Errorf("check namespace %s IPSet fail", namespaceName[3])
 	}
 	ok = checkPodLabelIPSet(t, fnp, namespaceName[3], "run1", "test1",
-		"10.0.0.3")
+		"10.0.0.3", "10.0.0.10")
 	if !ok{
 		t.Errorf("check pod label set %s:%s=%s IPSet fail", namespaceName[3],"run1","test1")
 	}
 	ok = checkPodLabelIPSet(t, fnp, namespaceName[3], "run2", "test2",
-		"10.0.0.1")
+		"10.0.0.1", "10.0.0.10")
 	if !ok{
 		t.Errorf("check pod label set %s:%s=%s IPSet fail", namespaceName[3],"run2","test2")
 	}
+	ok = checkPodXLabelIPSet(t, fnp, namespaceName[3], xLabel, "10.0.0.10")
+	if !ok{
+		t.Errorf("check pod xLabel set namespace:%s, label:%v IPSet fail", namespaceName[3], xLabel)
+	}
 	ok = checkNamespaceLabelIPSet(t, fnp, "ns2", "ns2",
-		"10.0.0.1", "10.0.0.3", "10.0.0.7")
+		"10.0.0.1", "10.0.0.3", "10.0.0.7", "10.0.0.10")
 	if !ok{
 		t.Errorf("check namespace label set %s=%s IPSet fail", "ns2","ns2")
 	}
 	ok = checkNamespaceLabelIPSet(t, fnp, "ns3", "ns3",
-		"10.0.0.1",  "10.0.0.3", "10.0.0.5")
+		"10.0.0.1",  "10.0.0.3", "10.0.0.5", "10.0.0.10")
 	if !ok{
 		t.Errorf("check namespace label set %s=%s IPSet fail", "ns3","ns3")
 	}
@@ -1387,28 +1494,33 @@ func TestPodUpdate(t *testing.T){
 		makeTestPod(namespaceName[3], "pod1", func(pod *coreApi.Pod) {
 			pod.Labels = map[string]string{"run2":"test2"}
 			pod.Status.PodIP = "10.0.0.1"
+			pod.Status.Conditions = []coreApi.PodCondition{{Type: coreApi.PodReady, Status: coreApi.ConditionTrue}}
 		}),
 		// 1 this pod in podLabelSet namespace[3]:run1=test1 and namespaceLabelSet ns2=ns2,ns3=ns3
 		makeTestPod(namespaceName[3], "pod2", func(pod *coreApi.Pod) {
 			pod.Labels = map[string]string{"run1":"test1"}
 			pod.Status.PodIP = "10.0.0.2"
+			pod.Status.Conditions = []coreApi.PodCondition{{Type: coreApi.PodReady, Status: coreApi.ConditionTrue}}
 		}),
 		// 2 this pod in podLabelSet namespace[3]:run1=test1 and namespaceLabelSet ns2=ns2,ns3=ns3
 		makeTestPod(namespaceName[3], "pod3", func(pod *coreApi.Pod) {
 			pod.Labels = map[string]string{"run1":"test1","run3":"test3"}
 			pod.Status.PodIP = "10.0.0.3"
+			pod.Status.Conditions = []coreApi.PodCondition{{Type: coreApi.PodReady, Status: coreApi.ConditionTrue}}
 		}),
 		// 3 this pod in namespaceLabelSet ns2=ns2,ns3=ns3
 		// #2 delete pod label run1=test1
 		makeTestPod(namespaceName[3], "pod3", func(pod *coreApi.Pod) {
 			pod.Labels = map[string]string{"run3":"test3"}
 			pod.Status.PodIP = "10.0.0.3"
+			pod.Status.Conditions = []coreApi.PodCondition{{Type: coreApi.PodReady, Status: coreApi.ConditionTrue}}
 		}),
 		// 4 this pod in podLabelSet namespace[3]:run1=test1, run2=test2 and namespaceLabelSet ns2=ns2,ns3=ns3
 		// #3 add pod label run1=test1 run2=test2
 		makeTestPod(namespaceName[3], "pod3", func(pod *coreApi.Pod) {
 			pod.Labels = map[string]string{"run1":"test1","run2":"test2","run4":"test4"}
 			pod.Status.PodIP = "10.0.0.3"
+			pod.Status.Conditions = []coreApi.PodCondition{{Type: coreApi.PodReady, Status: coreApi.ConditionTrue}}
 		}),
 	}
 
@@ -1424,6 +1536,10 @@ func TestPodUpdate(t *testing.T){
 	fnp.OnPodAdd(pods[2])
 	fnp.OnNetworkPolicyAdd(networkPolicies[8])
 
+	xLabel := make(map[string]string)
+	xLabel["run1"] = "test1"
+	xLabel["run2"] = "test2"
+
 	ok := checkPodLabelIPSet(t, fnp, namespaceName[3], "run1", "test1",
 		"10.0.0.2", "10.0.0.3")
 	if !ok{
@@ -1433,6 +1549,10 @@ func TestPodUpdate(t *testing.T){
 		"10.0.0.1")
 	if !ok{
 		t.Errorf("check pod label set %s:%s=%s IPSet fail", namespaceName[3],"run2","test2")
+	}
+	ok = checkPodXLabelIPSet(t, fnp, namespaceName[3], xLabel)
+	if !ok{
+		t.Errorf("check pod xLabel set namespace:%s, label:%v IPSet fail", namespaceName[3], xLabel)
 	}
 
 	//update pod without change
@@ -1447,6 +1567,10 @@ func TestPodUpdate(t *testing.T){
 	if !ok{
 		t.Errorf("check pod label set %s:%s=%s IPSet fail", namespaceName[3],"run2","test2")
 	}
+	ok = checkPodXLabelIPSet(t, fnp, namespaceName[3], xLabel)
+	if !ok{
+		t.Errorf("check pod xLabel set namespace:%s, label:%v IPSet fail", namespaceName[3], xLabel)
+	}
 
 	//update pod : delete label
 	fnp.OnPodUpdate(pods[2],pods[3])
@@ -1459,6 +1583,10 @@ func TestPodUpdate(t *testing.T){
 		"10.0.0.1")
 	if !ok{
 		t.Errorf("check pod label set %s:%s=%s IPSet fail", namespaceName[3],"run2","test2")
+	}
+	ok = checkPodXLabelIPSet(t, fnp, namespaceName[3], xLabel)
+	if !ok{
+		t.Errorf("check pod xLabel set namespace:%s, label:%v IPSet fail", namespaceName[3], xLabel)
 	}
 
 	//update pod : add label
@@ -1473,6 +1601,10 @@ func TestPodUpdate(t *testing.T){
 	if !ok{
 		t.Errorf("check pod label set %s:%s=%s IPSet fail", namespaceName[3],"run2","test2")
 	}
+	ok = checkPodXLabelIPSet(t, fnp, namespaceName[3], xLabel, "10.0.0.3")
+	if !ok{
+		t.Errorf("check pod xLabel set namespace:%s, label:%v IPSet fail", namespaceName[3], xLabel)
+	}
 
 	//update pod : back to pods[2]
 	fnp.OnPodUpdate(pods[4],pods[2])
@@ -1486,6 +1618,10 @@ func TestPodUpdate(t *testing.T){
 	if !ok{
 		t.Errorf("check pod label set %s:%s=%s IPSet fail", namespaceName[3],"run2","test2")
 	}
+	ok = checkPodXLabelIPSet(t, fnp, namespaceName[3], xLabel)
+	if !ok{
+		t.Errorf("check pod xLabel set namespace:%s, label:%v IPSet fail", namespaceName[3], xLabel)
+	}
 }
 
 // this test case has 4 step
@@ -1495,15 +1631,15 @@ func TestPodUpdate(t *testing.T){
 // 4. delete pod with empty ip, so enn-policy will do nothing since pod already deleted in step3
 
 // BTW, in real situation, when kubernetes create a new pod, enn-policy will watch
-// 1) OnPodAdd() <- assign pod name but with empty ip, enn-policy do nothing
-// 2) OnPodUpdate() <- change pod status, enn-policy do nothing
-// 3) OnPodUpdate() <- second time change pod status, enn-policy do nothing
-// 4) OnPodUpdate() <- assign ip to this pod, enn-policy will to add pod operation
+// 1) OnPodAdd() <- assign pod name but with empty ip, pod phase: pending. enn-policy do nothing
+// 2) OnPodUpdate() <- change pod status, pod phase: pending, pod condition: PodScheduled. enn-policy do nothing
+// 3) OnPodUpdate() <- change pod status, pod phase: pending, pod condition: Initialized. enn-policy do nothing
+// 4) OnPodUpdate() <- assign ip to this pod, pod phase: running, pod condition: ready. enn-policy will to add pod operation
 // and when kubernetes delete a pod, enn-policy will watch
-// 1) OnPodUpdate() <- change pod status, enn-policy do nothing
-// 2) OnPodUpdate() <- delete pod ip, enn-policy will do delete pod operation
-// 3) OnPodUpdate() <- second time change pod status, enn-policy do nothing
-// 4) OnPodDelete() <- finally remove pod from kubernetes, but enn-policy still do nothing since pod already deleted in 2)
+// 1) OnPodUpdate() <- change pod status, pod phase: running, pod condition: ready. enn-policy do nothing
+// 2) OnPodUpdate() <- delete pod ip, pod phase: running, pod condition: ready false. enn-policy will do delete pod operation
+// 3) OnPodUpdate() <- change pod status, pod phase: running, pod condition: ready false. enn-policy do nothing
+// 4) OnPodDelete() <- finally remove pod from kubernetes, but enn-policy still do nothing since pod already deleted in 2). pod phase: running, pod condition: ready false.
 func TestEmptyIPPod(t *testing.T){
 
 	namespaces := []*coreApi.Namespace{
@@ -1517,11 +1653,13 @@ func TestEmptyIPPod(t *testing.T){
 		// 0 this pod should not in podLabelSet namespace[3]:run2=test2 and namespaceLabelSet ns2=ns2
 		makeTestPod(namespaceName[3], "pod1", func(pod *coreApi.Pod) {
 			pod.Labels = map[string]string{"run2":"test2"}
+			pod.Status.Conditions = []coreApi.PodCondition{{Type: coreApi.PodReady, Status: coreApi.ConditionFalse}}
 		}),
 		// 1 this pod in podLabelSet namespace[3]:run2=test2 and namespaceLabelSet ns2=ns2
 		makeTestPod(namespaceName[3], "pod1", func(pod *coreApi.Pod) {
 			pod.Labels = map[string]string{"run2":"test2"}
 			pod.Status.PodIP = "10.0.0.1"
+			pod.Status.Conditions = []coreApi.PodCondition{{Type: coreApi.PodReady, Status: coreApi.ConditionTrue}}
 		}),
 
 	}
@@ -1650,6 +1788,123 @@ func TestEmptyIPPod(t *testing.T){
 		}
 	}
 }
+// think about other pod life cycle:
+// 1. pod running -> completed
+// pod phase: Succeeded, condition: ready false, ip not empty
+// 2. pod ErrImagePull
+// pod phase: Pending, condition: ready false, ip not empty
+// 3. pod Err
+// OnPodUpdate() <- pod phase: Failed, condition: ready false, ip empty
+// OnPodUpdate() <- pod phase: Pending, condition: ready false, ip assigned
+// OnPodUpdate() <- pod phase: Failed, condition: ready false, ip empty
+func TestPodLifeCycle(t *testing.T){
+
+	namespaces := []*coreApi.Namespace{
+		//0
+		makeTestNamespace(namespaceName[3], func(namespace *coreApi.Namespace) {
+			namespace.Labels = map[string]string{"ns2":"ns2"}
+		}),
+	}
+
+	pods := []*coreApi.Pod{
+		makeTestPod(namespaceName[3], "pod1", func(pod *coreApi.Pod) {
+			pod.Labels = map[string]string{"run2":"test2"}
+			pod.Status.Conditions = []coreApi.PodCondition{{Type: coreApi.PodReady, Status: coreApi.ConditionFalse}}
+			pod.Status.Phase = coreApi.PodSucceeded
+			pod.Status.PodIP = "10.0.0.1"
+		}),
+		makeTestPod(namespaceName[3], "pod2", func(pod *coreApi.Pod) {
+			pod.Labels = map[string]string{"run2":"test2"}
+			pod.Status.Conditions = []coreApi.PodCondition{{Type: coreApi.PodReady, Status: coreApi.ConditionFalse}}
+			pod.Status.Phase = coreApi.PodPending
+			pod.Status.PodIP = "10.0.0.2"
+		}),
+		makeTestPod(namespaceName[3], "pod3", func(pod *coreApi.Pod) {
+			pod.Labels = map[string]string{"run2":"test2"}
+			pod.Status.Conditions = []coreApi.PodCondition{{Type: coreApi.PodReady, Status: coreApi.ConditionFalse}}
+			pod.Status.Phase = coreApi.PodFailed
+			pod.Status.PodIP = "10.0.0.3"
+		}),
+		makeTestPod(namespaceName[3], "pod4", func(pod *coreApi.Pod) {
+			pod.Labels = map[string]string{"run2":"test2"}
+			pod.Status.Conditions = []coreApi.PodCondition{{Type: coreApi.PodReady, Status: coreApi.ConditionTrue}}
+			pod.Status.Phase = coreApi.PodRunning
+			pod.Status.PodIP = "10.0.0.4"
+		}),
+	}
+
+	fnp := NewFakeEnnPolicy("10.244.0.0/16")
+
+	fnp.OnNamespaceAdd(namespaces[0])
+	fnp.OnNetworkPolicyAdd(networkPolicies[8])
+
+	fnp.OnPodAdd(pods[0])
+	fnp.OnPodAdd(pods[1])
+	fnp.OnPodAdd(pods[2])
+	fnp.OnPodAdd(pods[3])
+
+	// should only pod[3] and pod [1] added into ipset
+
+	xLabel := make(map[string]string)
+	xLabel["run2"] = "test2"
+
+	ok := checkPodLabelIPSet(t, fnp, namespaceName[3], "run2", "test2", "10.0.0.2", "10.0.0.4")
+	if !ok{
+		t.Errorf("check pod label set %s:%s=%s IPSet fail", namespaceName[3],"run2","test2")
+	}
+	ok = checkPodXLabelIPSet(t, fnp, namespaceName[3], xLabel, "10.0.0.2", "10.0.0.4")
+	if !ok{
+		t.Errorf("check pod xLabel set namespace:%s, label:%v IPSet fail", namespaceName[3], xLabel)
+	}
+}
+
+// TestPodHostNetwork will test ipset rules when pod is set to hostNetwork
+// by default, we should not isolate a pod using hostNetwork
+func TestPodHostNetwork(t *testing.T){
+
+	namespaces := []*coreApi.Namespace{
+		//0
+		makeTestNamespace(namespaceName[3], func(namespace *coreApi.Namespace) {
+			namespace.Labels = map[string]string{"ns2":"ns2"}
+		}),
+	}
+
+	pods := []*coreApi.Pod{
+		makeTestPod(namespaceName[3], "pod1", func(pod *coreApi.Pod) {
+			pod.Labels = map[string]string{"run2":"test2"}
+			pod.Status.Conditions = []coreApi.PodCondition{{Type: coreApi.PodReady, Status: coreApi.ConditionTrue}}
+			pod.Status.Phase = coreApi.PodRunning
+			pod.Status.PodIP = "10.0.0.1"
+			pod.Spec.HostNetwork = true
+		}),
+		makeTestPod(namespaceName[3], "pod4", func(pod *coreApi.Pod) {
+			pod.Labels = map[string]string{"run2":"test2"}
+			pod.Status.Conditions = []coreApi.PodCondition{{Type: coreApi.PodReady, Status: coreApi.ConditionTrue}}
+			pod.Status.Phase = coreApi.PodRunning
+			pod.Status.PodIP = "10.0.0.2"
+		}),
+	}
+
+	fnp := NewFakeEnnPolicy("10.244.0.0/16")
+
+	fnp.OnNamespaceAdd(namespaces[0])
+	fnp.OnNetworkPolicyAdd(networkPolicies[8])
+
+	fnp.OnPodAdd(pods[0])
+	fnp.OnPodAdd(pods[1])
+
+	xLabel := make(map[string]string)
+	xLabel["run2"] = "test2"
+
+	ok := checkPodLabelIPSet(t, fnp, namespaceName[3], "run2", "test2", "10.0.0.2")
+	if !ok{
+		t.Errorf("check pod label set %s:%s=%s IPSet fail", namespaceName[3],"run2","test2")
+	}
+	ok = checkPodXLabelIPSet(t, fnp, namespaceName[3], xLabel, "10.0.0.2")
+	if !ok{
+		t.Errorf("check pod xLabel set namespace:%s, label:%v IPSet fail", namespaceName[3], xLabel)
+	}
+}
 
 // this test case will add some namespace and delete some namespace, then check whether corresponding ipset is correct
 // ipset include namespace ipset and namespace label ipset
@@ -1679,36 +1934,44 @@ func TestNamespaceAddDelete(t *testing.T){
 		// 0 namespace1
 		makeTestPod(namespaceName[1], "pod0", func(pod *coreApi.Pod) {
 			pod.Status.PodIP = "10.0.0.1"
+			pod.Status.Conditions = []coreApi.PodCondition{{Type: coreApi.PodReady, Status: coreApi.ConditionTrue}}
 		}),
 		// 1 namespace1
 		makeTestPod(namespaceName[1], "pod1", func(pod *coreApi.Pod) {
 			pod.Status.PodIP = "10.0.0.2"
+			pod.Status.Conditions = []coreApi.PodCondition{{Type: coreApi.PodReady, Status: coreApi.ConditionTrue}}
 		}),
 		// 2 namespace2
 		makeTestPod(namespaceName[2], "pod2", func(pod *coreApi.Pod) {
 			pod.Status.PodIP = "10.0.0.3"
+			pod.Status.Conditions = []coreApi.PodCondition{{Type: coreApi.PodReady, Status: coreApi.ConditionTrue}}
 		}),
 		// 3 namespace2
 		makeTestPod(namespaceName[2], "pod3", func(pod *coreApi.Pod) {
 			pod.Status.PodIP = "10.0.0.4"
+			pod.Status.Conditions = []coreApi.PodCondition{{Type: coreApi.PodReady, Status: coreApi.ConditionTrue}}
 		}),
 		// 4 namespace3
 		makeTestPod(namespaceName[3], "pod4", func(pod *coreApi.Pod) {
 			pod.Labels = map[string]string{"run1":"test1","run2":"test2"}
 			pod.Status.PodIP = "10.0.0.5"
+			pod.Status.Conditions = []coreApi.PodCondition{{Type: coreApi.PodReady, Status: coreApi.ConditionTrue}}
 		}),
 		// 5 namespace3
 		makeTestPod(namespaceName[3], "pod5", func(pod *coreApi.Pod) {
 			pod.Labels = map[string]string{"run1":"test1","run2":"test2"}
 			pod.Status.PodIP = "10.0.0.6"
+			pod.Status.Conditions = []coreApi.PodCondition{{Type: coreApi.PodReady, Status: coreApi.ConditionTrue}}
 		}),
 		// 6 namespace4
 		makeTestPod(namespaceName[4], "pod6", func(pod *coreApi.Pod) {
 			pod.Status.PodIP = "10.0.0.7"
+			pod.Status.Conditions = []coreApi.PodCondition{{Type: coreApi.PodReady, Status: coreApi.ConditionTrue}}
 		}),
 		// 7 namespace4
 		makeTestPod(namespaceName[4], "pod7", func(pod *coreApi.Pod) {
 			pod.Status.PodIP = "10.0.0.8"
+			pod.Status.Conditions = []coreApi.PodCondition{{Type: coreApi.PodReady, Status: coreApi.ConditionTrue}}
 		}),
 	}
 
@@ -1826,28 +2089,34 @@ func TestNamespaceUpdate(t *testing.T){
 		// 0 namespace2
 		makeTestPod(namespaceName[2], "pod2", func(pod *coreApi.Pod) {
 			pod.Status.PodIP = "10.0.0.1"
+			pod.Status.Conditions = []coreApi.PodCondition{{Type: coreApi.PodReady, Status: coreApi.ConditionTrue}}
 		}),
 		// 1 namespace2
 		makeTestPod(namespaceName[2], "pod3", func(pod *coreApi.Pod) {
 			pod.Status.PodIP = "10.0.0.2"
+			pod.Status.Conditions = []coreApi.PodCondition{{Type: coreApi.PodReady, Status: coreApi.ConditionTrue}}
 		}),
 		// 2 namespace3
 		makeTestPod(namespaceName[3], "pod4", func(pod *coreApi.Pod) {
 			pod.Labels = map[string]string{"run1":"test1","run2":"test2"}
 			pod.Status.PodIP = "10.0.0.3"
+			pod.Status.Conditions = []coreApi.PodCondition{{Type: coreApi.PodReady, Status: coreApi.ConditionTrue}}
 		}),
 		// 3 namespace3
 		makeTestPod(namespaceName[3], "pod5", func(pod *coreApi.Pod) {
 			pod.Labels = map[string]string{"run1":"test1","run2":"test2"}
 			pod.Status.PodIP = "10.0.0.4"
+			pod.Status.Conditions = []coreApi.PodCondition{{Type: coreApi.PodReady, Status: coreApi.ConditionTrue}}
 		}),
 		// 4 namespace4
 		makeTestPod(namespaceName[4], "pod6", func(pod *coreApi.Pod) {
 			pod.Status.PodIP = "10.0.0.5"
+			pod.Status.Conditions = []coreApi.PodCondition{{Type: coreApi.PodReady, Status: coreApi.ConditionTrue}}
 		}),
 		// 5 namespace4
 		makeTestPod(namespaceName[4], "pod7", func(pod *coreApi.Pod) {
 			pod.Status.PodIP = "10.0.0.6"
+			pod.Status.Conditions = []coreApi.PodCondition{{Type: coreApi.PodReady, Status: coreApi.ConditionTrue}}
 		}),
 	}
 
@@ -2186,78 +2455,137 @@ func checkEnnForward(t *testing.T, fnp *EnnPolicy, namespace string, InOrE strin
 func checkNamespaceChain(t *testing.T, fnp *EnnPolicy, namespaceChain string, ipRange string, InOrE string) (string, bool){
 
 	var policyEntry string
+	var direction string
+	var entry string
 	if strings.Compare(InOrE,"ingress") == 0{
 		policyEntry = "ENN-PLY-IN"
+		direction = "src"
 	} else if strings.Compare(InOrE,"egress") == 0{
 		policyEntry = "ENN-PLY-E"
+		direction = "dst"
 	} else {
 		t.Errorf("invalid InOrE")
 		return "", false
 	}
 
-	var count int
-	var entry string
+	// -N ENN-INGRESS-MYHOMZGODZAKSXF7
+	// -A ENN-INGRESS-MYHOMZGODZAKSXF7 -m set --match-set ENN-FLANNEL-PUQSI3TYGKKXTCCD src -m comment --comment "match flannel ip net: 10.244.0.0/16" -j ACCEPT
+	// -A ENN-INGRESS-MYHOMZGODZAKSXF7 -m set --match-set ENN-RANGEIP-CISAOGDXR7V5L4LB src -m comment --comment "match ip range 10.244.0.0/16" -j ENN-PLY-IN-KK2G2CFELVWPDXUK
+	// -A ENN-INGRESS-MYHOMZGODZAKSXF7 -m comment --comment "accept other traffic beyond ip range" -j ACCEPT
+
 	lists, _ := fnp.iptablesInterface.List(FILTER_TABLE, namespaceChain)
-	if strings.Compare(ipRange, "0.0.0.0/0") == 0{
 
-		count = 0
+	if len(lists) < 2{
+		t.Errorf("numbers of namespaceChain: %s should more than 2", namespaceChain)
+		return "", false
+	}
 
-		for _, rule := range lists {
-			if strings.Contains(rule, "0.0.0.0/0") && strings.Contains(rule, policyEntry) {
+	if fnp.acceptFlannel{
 
-				count = count + 1
-				strs := strings.Split(rule," ")
+		if !strings.Contains(lists[1], "ENN-FLANNEL") ||
+			!strings.Contains(lists[1], direction) ||
+			!strings.Contains(lists[1], "ACCEPT"){
+			t.Errorf("cannot find flannelNet accept chain in namespaceChain: %s", namespaceChain)
+			for _, list := range lists{
+				t.Errorf("%s", list)
+			}
+			return "", false
+		}
+
+		if strings.Compare(ipRange, "0.0.0.0/0") == 0{
+
+			if len(lists) != 3{
+				t.Errorf("numbers of namespaceChain: %s is not correct: %d, expected: %d", namespaceChain, len(lists), 3)
+				for _, list := range lists{
+					t.Errorf("%s", list)
+				}
+				return "", false
+			}
+			if strings.Contains(lists[2], "0.0.0.0/0") && strings.Contains(lists[2], policyEntry) {
+				strs := strings.Split(lists[2]," ")
 				entry = strs[len(strs)-1]
-
+				return entry, true
 			}
-		}
-
-		if count == 0{
 			t.Errorf("cannot find corresponding policyChain in namespaceChain: %s", namespaceChain)
+			for _, list := range lists{
+				t.Errorf("%s", list)
+			}
+			return "", false
+
+		} else {
+			if len(lists) != 4{
+				t.Errorf("numbers of namespaceChain: %s is not correct: %d, expected: %d", namespaceChain, len(lists), 4)
+				for _, list := range lists{
+					t.Errorf("%s", list)
+				}
+				return "", false
+			}
+			if !strings.Contains(lists[3], "ACCEPT"){
+				t.Errorf("cannot find default accept rule for namespaceChain %s", namespaceChain)
+				for _, list := range lists{
+					t.Errorf("%s", list)
+				}
+				return "", false
+			}
+			if strings.Contains(lists[2], "ENN-RANGEIP") && strings.Contains(lists[2], policyEntry) {
+				strs := strings.Split(lists[2]," ")
+				entry = strs[len(strs)-1]
+				return entry, true
+			}
+			t.Errorf("cannot find corresponding policyChain in namespaceChain: %s", namespaceChain)
+			for _, list := range lists{
+				t.Errorf("%s", list)
+			}
 			return "", false
 		}
 
-		if count > 1{
-			t.Errorf("for a given namespaceChain: %s, find more than 1 entry %d",namespaceChain, count)
-		}
-
-		return entry, true
 	} else {
+		if strings.Compare(ipRange, "0.0.0.0/0") == 0{
 
-		count = 0
-
-		for i := 1; i < len(lists); i++{
-
-			if i == len(lists) - 1{
-				if strings.Contains(lists[i], "ACCEPT"){
-					continue
-				} else {
-					t.Errorf("cannot find default accept rule for namespaceChain %s", namespaceChain)
-					t.Errorf("rule %s", lists[i])
-					return "", false
+			if len(lists) != 2{
+				t.Errorf("numbers of namespaceChain: %s is not correct: %d, expected: %d", namespaceChain, len(lists), 3)
+				for _, list := range lists{
+					t.Errorf("%s", list)
 				}
-			} else {
-
-				if strings.Contains(lists[i], "ENN-RANGEIP") && strings.Contains(lists[i], policyEntry) {
-
-					count = count + 1
-					strs := strings.Split(lists[i], " ")
-					entry = strs[len(strs) - 1]
-
-				}
+				return "", false
 			}
-		}
-
-		if count == 0{
+			if strings.Contains(lists[1], "0.0.0.0/0") && strings.Contains(lists[1], policyEntry) {
+				strs := strings.Split(lists[1]," ")
+				entry = strs[len(strs)-1]
+				return entry, true
+			}
 			t.Errorf("cannot find corresponding policyChain in namespaceChain: %s", namespaceChain)
+			for _, list := range lists{
+				t.Errorf("%s", list)
+			}
+			return "", false
+
+		} else {
+			if len(lists) != 3{
+				t.Errorf("numbers of namespaceChain: %s is not correct: %d, expected: %d", namespaceChain, len(lists), 4)
+				for _, list := range lists{
+					t.Errorf("%s", list)
+				}
+				return "", false
+			}
+			if !strings.Contains(lists[2], "ACCEPT"){
+				t.Errorf("cannot find default accept rule for namespaceChain %s", namespaceChain)
+				for _, list := range lists{
+					t.Errorf("%s", list)
+				}
+				return "", false
+			}
+			if strings.Contains(lists[1], "ENN-RANGEIP") && strings.Contains(lists[1], policyEntry) {
+				strs := strings.Split(lists[1]," ")
+				entry = strs[len(strs)-1]
+				return entry, true
+			}
+			t.Errorf("cannot find corresponding policyChain in namespaceChain: %s", namespaceChain)
+			for _, list := range lists{
+				t.Errorf("%s", list)
+			}
 			return "", false
 		}
-
-		if count > 1{
-			t.Errorf("for a given namespaceChain: %s, find more than 1 entry %d",namespaceChain, count)
-		}
-
-		return entry, true
 	}
 }
 
@@ -2416,12 +2744,20 @@ func checkDispatchChainNamespaceSelector(t *testing.T, dispatchChain, namespace,
 	return true
 }
 
-func checkDispatchChainIPBlock(t *testing.T, dispatchChain, namespace, InOrE, specK, specV, ipBlock string) bool{
+func checkDispatchChainIPBlock(t *testing.T, fnp *EnnPolicy, dispatchChain, namespace, InOrE, specK, specV string, ipBlock utilpolicy.CIDRRange) bool{
 
 	srcSet := ""
 	dstSet := ""
 	ipBlockDirect := ""
 	strs := strings.Split(dispatchChain," ")
+
+	ipCIDRChain := strs[len(strs) - 1]
+	if !strings.Contains(ipCIDRChain, "ENN-IPCIDR"){
+		t.Errorf("dispatch ipBlock chain -j is not valid")
+		t.Errorf("%s",strs)
+		return false
+	}
+
 	for i, _ := range strs{
 		if strings.Compare(strs[i], "--match-set") == 0 && (i + 2) < len(strs){
 			if strings.Compare(strs[i+2], "src") == 0{
@@ -2432,12 +2768,12 @@ func checkDispatchChainIPBlock(t *testing.T, dispatchChain, namespace, InOrE, sp
 			}
 		}
 		if strings.Compare(strs[i], "-s") == 0 && (i + 1) < len(strs){
-			if strings.Compare(strs[i+1], ipBlock) == 0{
+			if strings.Compare(strs[i+1], ipBlock.CIDR) == 0{
 				ipBlockDirect = "-s"
 			}
 		}
 		if strings.Compare(strs[i], "-d") == 0 && (i + 1) < len(strs){
-			if strings.Compare(strs[i+1], ipBlock) == 0{
+			if strings.Compare(strs[i+1], ipBlock.CIDR) == 0{
 				ipBlockDirect = "-d"
 			}
 		}
@@ -2474,6 +2810,98 @@ func checkDispatchChainIPBlock(t *testing.T, dispatchChain, namespace, InOrE, sp
 	} else {
 		t.Errorf("invalid InOrE %s", InOrE)
 		return false
+	}
+
+	return checkChainIPCIDR(t, fnp, ipCIDRChain, ipBlock)
+}
+
+func checkChainIPCIDR(t *testing.T, fnp *EnnPolicy, ipCIDRChain string, ipBlock utilpolicy.CIDRRange)bool{
+
+	lists, _ := fnp.iptablesInterface.List(FILTER_TABLE, ipCIDRChain)
+
+	if len(lists) != 3{
+		t.Errorf("checkChainIPCIDR: entry len is %d, expected 3", len(lists))
+		return false
+	}
+
+	strs := strings.Split(lists[2]," ")
+	if strings.Compare(strs[len(strs)-1], "ACCEPT") != 0{
+		t.Errorf("cidr default rule is not accept")
+		t.Errorf("%s", lists[2])
+		return false
+	}
+
+	if !strings.Contains(lists[1], "REJECT"){
+		t.Errorf("cidr first rule is not reject")
+		t.Errorf("%s", lists[1])
+		return false
+	}
+
+	strs = strings.Split(lists[1]," ")
+	var cidrIPSet string
+	for i, _ := range strs{
+		if strings.Contains(strs[i], "ENN-IPTSET"){
+			cidrIPSet = strs[i]
+
+			return checkIPSetCIDR(t, fnp, cidrIPSet, ipBlock)
+		}
+	}
+
+	t.Errorf("cannot find cidrIPSet")
+	t.Errorf("%s", lists[1])
+	return false
+}
+
+func checkIPSetCIDR(t *testing.T, fnp *EnnPolicy, ipsetName string, ipBlock utilpolicy.CIDRRange) bool{
+
+	ipset, err := fnp.ipsetInterface.GetIPSet(ipsetName)
+	if err != nil{
+		t.Errorf("get ipset %s error: %v", ipsetName, err)
+		return false
+	}
+	if ipset.Name != ipsetName{
+		t.Errorf("get ipset invalid ipset name: %s, expect: %s", ipset.Name, ipsetName)
+		return false
+	}
+	if ipset.Type != utilIPSet.TypeHashNet{
+		t.Errorf("get ipset invalid ipset type: %s, expect: %s", ipset.Type, utilIPSet.TypeHashNet)
+		return false
+	}
+	entries, err := fnp.ipsetInterface.ListEntry(ipset)
+	if err != nil{
+		t.Errorf("list ipset %s entry error: %v", ipsetName, err)
+		return false
+	}
+
+	kernelMap := make(map[string]bool)
+	for _, entry := range entries{
+		kernelMap[entry.Net] = true
+	}
+
+	expectedMap := make(map[string]bool)
+	for _, except := range ipBlock.ExceptCIDR{
+		expectedMap[except] = true
+	}
+
+	if len(kernelMap) != len(expectedMap){
+		t.Errorf("entry len is not correct: %d, expected %d", len(kernelMap), len(expectedMap))
+		return false
+	}
+
+	for kernelIp, _ := range kernelMap{
+		_, ok := expectedMap[kernelIp]
+		if !ok{
+			t.Errorf("unexpected net find: %s", kernelIp)
+			return false
+		}
+	}
+
+	for ip, _ := range expectedMap{
+		_, ok := kernelMap[ip]
+		if !ok{
+			t.Errorf("expected net not find in kernel entry: %s", ip)
+			return false
+		}
 	}
 
 	return true
@@ -2582,6 +3010,59 @@ func checkIPRangeIPSet(t *testing.T, fnp *EnnPolicy, ipRange string, nets ...str
 	return true
 }
 
+func checkFlannelNetIPSet(t *testing.T, fnp *EnnPolicy, flannelNet string, flannelLen string, expectedMap map[string]bool) bool{
+
+	ipsetName := ennFlannelIPSetName(flannelNet, flannelLen)
+	ipset, err := fnp.ipsetInterface.GetIPSet(ipsetName)
+	if err != nil{
+		t.Errorf("get ipset %s error: %v", ipsetName, err)
+		return false
+	}
+	if ipset.Name != ipsetName{
+		t.Errorf("get ipset invalid ipset name: %s, expect: %s", ipset.Name, ipsetName)
+		return false
+	}
+	if ipset.Type != utilIPSet.TypeHashIP{
+		t.Errorf("get ipset invalid ipset type: %s, expect: %s", ipset.Type, utilIPSet.TypeHashIP)
+		return false
+	}
+	entries, err := fnp.ipsetInterface.ListEntry(ipset)
+	if err != nil{
+		t.Errorf("list ipset %s entry error: %v", ipsetName, err)
+		return false
+	}
+
+	// build map for kernel entry
+	kernelMap := make(map[string]bool)
+	for _, entry := range entries{
+		kernelMap[entry.IP] = true
+	}
+
+	if len(kernelMap) != len(expectedMap){
+		t.Errorf("entry len is not correct: %d, expected %d", len(kernelMap), len(expectedMap))
+		return false
+	}
+
+	for kernelIp, _ := range kernelMap{
+		_, ok := expectedMap[kernelIp]
+		if !ok{
+			t.Errorf("unexpected ip find: %s", kernelIp)
+			return false
+		}
+	}
+
+	for ip, _ := range expectedMap{
+		_, ok := kernelMap[ip]
+		if !ok{
+			t.Errorf("expected ip not find in kernel entry: %s", ip)
+			return false
+		}
+	}
+
+
+	return true
+}
+
 func checkNamespacePodIPSetDelete(t *testing.T, fnp *EnnPolicy, namespace string) bool{
 
 	ipsetName := ennNamespaceIPSetName(namespace)
@@ -2603,6 +3084,57 @@ func checkNamespacePodIPSetDelete(t *testing.T, fnp *EnnPolicy, namespace string
 func checkNamespacePodIPSet(t *testing.T, fnp *EnnPolicy, namespace string, podIPs ...string) bool{
 
 	ipsetName := ennNamespaceIPSetName(namespace)
+	ipset, err := fnp.ipsetInterface.GetIPSet(ipsetName)
+	if err != nil{
+		t.Errorf("get ipset %s error: %v", ipsetName, err)
+		return false
+	}
+	if ipset.Name != ipsetName{
+		t.Errorf("get ipset invalid ipset name: %s, expect: %s", ipset.Name, ipsetName)
+		return false
+	}
+	if ipset.Type != utilIPSet.TypeHashIP{
+		t.Errorf("get ipset invalid ipset type: %s, expect: %s", ipset.Type, utilIPSet.TypeHashIP)
+		return false
+	}
+	entries, err := fnp.ipsetInterface.ListEntry(ipset)
+	if err != nil{
+		t.Errorf("list ipset %s entry error: %v", ipsetName, err)
+		return false
+	}
+	if len(entries) != len(podIPs){
+		t.Errorf("ipset %s invalid entry len %d, expect %d", ipsetName, len(entries), len(podIPs))
+		return false
+	}
+
+	for _, ip := range podIPs{
+		find := false
+		for _, entry := range entries{
+			if entry.IP == ip{
+				find = true
+				break
+			}
+		}
+		if !find{
+			t.Errorf("ipset %s cannot find entry %s in kernl", ipsetName, ip)
+			for _, entry := range entries{
+				t.Errorf("kernel entry: %s", entry.IP)
+			}
+			return false
+		}
+	}
+
+	return true
+}
+
+func checkPodXLabelIPSet(t *testing.T, fnp *EnnPolicy, namespace string, label map[string]string, podIPs ...string) bool{
+
+	var xLabel []string
+	for k,v := range label{
+		xLabel = append(xLabel, k)
+		xLabel = append(xLabel, v)
+	}
+	ipsetName := ennXLabelIPSetName(namespace, "pod", xLabel)
 	ipset, err := fnp.ipsetInterface.GetIPSet(ipsetName)
 	if err != nil{
 		t.Errorf("get ipset %s error: %v", ipsetName, err)
@@ -2669,6 +3201,9 @@ func checkPodLabelIPSet(t *testing.T, fnp *EnnPolicy, namespace, labelK, labelV 
 	}
 	if len(entries) != len(podIPs){
 		t.Errorf("ipset %s invalid entry len %d, expect %d", ipsetName, len(entries), len(podIPs))
+		for _, entry := range entries{
+			t.Errorf("kernel entry: %s", entry.IP)
+		}
 		return false
 	}
 

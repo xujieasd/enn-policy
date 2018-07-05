@@ -121,6 +121,12 @@ func PodToPodMatchLabelMap(pod *api.Pod) PodMatchLabelMap {
 		return nil
 	}
 
+	glog.V(7).Infof("watch podInfo: namespacedName: %s:%s, ip: %s, phase: %s", pod.Namespace, pod.Name, pod.Status.PodIP, pod.Status.Phase)
+
+	for i := range pod.Status.Conditions{
+		glog.V(7).Infof("pod condition type: %s, states: %s", string(pod.Status.Conditions[i].Type), string(pod.Status.Conditions[i].Status))
+	}
+
 	if len(pod.Labels) == 0{
 		glog.V(7).Infof("skip build map because pod: %s/%s does not have label", pod.Namespace, pod.Name)
 	}
@@ -132,8 +138,18 @@ func PodToPodMatchLabelMap(pod *api.Pod) PodMatchLabelMap {
 	// enn-policy should not handle pod with empty ip, enn-policy stores ip in it's map only when pod ip is real,
 	// so if pod ip is empty, skip build map
 
-	if pod.Status.PodIP == ""{
+	if pod.Status.PodIP == "" {
 		glog.V(6).Infof("skip build map because pod: %s/%s ip is empty", pod.Namespace, pod.Name)
+		return nil
+	}
+
+	if pod.Spec.HostNetwork{
+		glog.V(6).Infof("skip build pod map because pod: %s/%s host network is true", pod.Namespace, pod.Name)
+		return nil
+	}
+
+	if !IsPodValid(pod){
+		glog.V(6).Infof("pod: %s/%s is not valid pod phase: %s", pod.Namespace, pod.Name, string(pod.Status.Phase))
 		return nil
 	}
 
@@ -173,8 +189,18 @@ func PodToNamespacePodMap(pod *api.Pod) NamespacePodMap {
 	// enn-policy should not handle pod with empty ip, enn-policy stores ip in it's map only when pod ip is real,
 	// so if pod ip is empty, skip build map
 
-	if pod.Status.PodIP == ""{
+	if pod.Status.PodIP == "" {
 		glog.V(6).Infof("skip build map because pod: %s/%s ip is empty", pod.Namespace, pod.Name)
+		return nil
+	}
+
+	if pod.Spec.HostNetwork{
+		glog.V(6).Infof("skip build pod map because pod: %s/%s host network is true", pod.Namespace, pod.Name)
+		return nil
+	}
+
+	if !IsPodValid(pod){
+		glog.V(6).Infof("pod: %s/%s is not valid pod phase: %s", pod.Namespace, pod.Name, string(pod.Status.Phase))
 		return nil
 	}
 

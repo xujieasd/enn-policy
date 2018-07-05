@@ -441,7 +441,7 @@ func TestEnnIPSet_FlushIPSet(t *testing.T) {
 		} else {
 			entry, _ := ipset.ListEntry(testIPSet[i])
 			if len(entry) != 0{
-				t.Errorf("ipset %s:%s entry is %s expect 0", testIPSet[i].Name, testIPSet[i].Type, len(entry))
+				t.Errorf("ipset %s:%s entry is %d expect 0", testIPSet[i].Name, testIPSet[i].Type, len(entry))
 			}
 		}
 	}

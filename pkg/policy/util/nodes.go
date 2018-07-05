@@ -33,6 +33,7 @@ func GetNode(clientset *kubernetes.Clientset, hostnameOverride string) (*apiv1.N
 		if err == nil {
 			return node, nil
 		}
+		return nil, fmt.Errorf("Failed to identify the node: %v", err)
 	}
 
 	return nil, fmt.Errorf("Failed to identify the node by hostname or --hostname-override")

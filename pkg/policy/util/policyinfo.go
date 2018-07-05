@@ -25,6 +25,12 @@ type NamespacedLabel struct {
 	LabelValue        string
 }
 
+type NamespacedLabelMap struct {
+
+	Namespace         string
+	Label             map[string]string
+}
+
 type NetworkPolicyMap map[types.NamespacedName]*NetworkPolicyInfo
 
 // NetworkPolicyInfo will collect useful information from networkPolicy spec
@@ -53,9 +59,7 @@ type IngressRule struct {
 	Ports             []PolicyPort
 	PodSelector       []LabelSelector
 	NamespaceSelector []LabelSelector
-	CIDR              []string
-	// todo handler exceptCIDR
-	ExceptCIDR        []string
+	IPBlock           []CIDRRange
 }
 
 // EgressRule describes a particular set of traffic that is allowed out of pods
@@ -65,9 +69,7 @@ type EgressRule struct {
 	Ports             []PolicyPort
 	PodSelector       []LabelSelector
 	NamespaceSelector []LabelSelector
-	CIDR              []string
-	// todo handler exceptCIDR
-	ExceptCIDR        []string
+	IPBlock           []CIDRRange
 }
 
 type TypedRule struct {
@@ -75,9 +77,7 @@ type TypedRule struct {
 	Ports             []PolicyPort
 	PodSelector       []LabelSelector
 	NamespaceSelector []LabelSelector
-	CIDR              []string
-	// todo handler exceptCIDR
-	ExceptCIDR        []string
+	IPBlock           []CIDRRange
 }
 
 type PolicyPort struct {
@@ -90,6 +90,11 @@ type LabelSelector struct {
 	Label             map[string]string
 	// the set of pods which corresponding to PodSelector and NamespaceSelector, key: portIP value:PodInfo
 	MatchPods         map[string]PodInfo
+}
+
+type CIDRRange struct {
+	CIDR              string
+	ExceptCIDR        []string
 }
 
 
@@ -163,8 +168,7 @@ func buildNetworkPolicyInfo(networkPolicy *policyApi.NetworkPolicy) *NetworkPoli
 			Ports:              make([]PolicyPort, 0),
 			PodSelector:        make([]LabelSelector, 0),
 			NamespaceSelector:  make([]LabelSelector, 0),
-			CIDR:               make([]string, 0),
-			ExceptCIDR:         make([]string, 0),
+			IPBlock:            make([]CIDRRange, 0),
 		}
 
 		for _, specPorts := range specIngress.Ports{
@@ -199,9 +203,15 @@ func buildNetworkPolicyInfo(networkPolicy *policyApi.NetworkPolicy) *NetworkPoli
 
 			if specPeer.IPBlock != nil {
 
-				InfoIngress.CIDR = append(InfoIngress.CIDR, specPeer.IPBlock.CIDR)
+				cidrRange := CIDRRange{
+					CIDR:        specPeer.IPBlock.CIDR,
+					ExceptCIDR:  make([]string, 0),
+				}
+				for i := range specPeer.IPBlock.Except{
+					cidrRange.ExceptCIDR = append(cidrRange.ExceptCIDR, specPeer.IPBlock.Except[i])
+				}
 
-				// todo: need to hanlder exceptCIDR
+				InfoIngress.IPBlock = append(InfoIngress.IPBlock, cidrRange)
 			}
 		}
 
@@ -216,8 +226,7 @@ func buildNetworkPolicyInfo(networkPolicy *policyApi.NetworkPolicy) *NetworkPoli
 			Ports:              make([]PolicyPort, 0),
 			PodSelector:        make([]LabelSelector, 0),
 			NamespaceSelector:  make([]LabelSelector, 0),
-			CIDR:               make([]string, 0),
-			ExceptCIDR:         make([]string, 0),
+			IPBlock:            make([]CIDRRange, 0),
 		}
 
 		for _, specPorts := range specEgress.Ports{
@@ -253,9 +262,15 @@ func buildNetworkPolicyInfo(networkPolicy *policyApi.NetworkPolicy) *NetworkPoli
 
 			if specPeer.IPBlock != nil {
 
-				InfoEgress.CIDR = append(InfoEgress.CIDR, specPeer.IPBlock.CIDR)
+				cidrRange := CIDRRange{
+					CIDR:        specPeer.IPBlock.CIDR,
+					ExceptCIDR:  make([]string, 0),
+				}
+				for i := range specPeer.IPBlock.Except{
+					cidrRange.ExceptCIDR = append(cidrRange.ExceptCIDR, specPeer.IPBlock.Except[i])
+				}
 
-				// todo: need to hanlder exceptCIDR
+				InfoEgress.IPBlock = append(InfoEgress.IPBlock, cidrRange)
 			}
 		}
 

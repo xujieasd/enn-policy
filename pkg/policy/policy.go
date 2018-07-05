@@ -9,9 +9,9 @@ import (
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/apimachinery/pkg/types"
 	"github.com/golang/glog"
-
 	utilIPSet "enn-policy/pkg/util/ipset"
 	utiliptables "enn-policy/pkg/util/k8siptables"
+	utiltool "enn-policy/pkg/util/tool"
 	"enn-policy/pkg/util/iptables"
 	"enn-policy/app/options"
 
@@ -25,6 +25,7 @@ import (
 	"strconv"
 	"strings"
 	"bytes"
+	"sort"
 )
 
 const (
@@ -62,6 +63,10 @@ type EnnPolicy struct {
 	clusterCIDR             string
 	iPRange                 string
 
+	acceptFlannel           bool
+	flannelNet              string
+	flannelLen              int
+
 	initialized             int32
 	networkPolicySynced     bool
 	podSynced               bool
@@ -85,6 +90,10 @@ type EnnPolicy struct {
 
 	// map activeIPSets stores the active ipsets created by syncPolicyRules which key is ipset name
 	activeIPSets            map[string]*utilIPSet.IPSet
+	// map podXLabelMap represent the label information of spec.podSelector of each networkPolicy
+	podXLabelMap            map[types.NamespacedName]*utilpolicy.NamespacedLabelMap
+	// map podXLabelSet represent ths ipset for spec.podSelector of each networkPolicy
+	podXLabelSet            map[types.NamespacedName]*utilIPSet.IPSet
 	// map podLabelSet represent the ipset for podSelector
 	podLabelSet             map[utilpolicy.NamespacedLabel]*utilIPSet.IPSet
 	// map namespacePodLabelSet represent the ipset for namespaceSelector
@@ -113,9 +122,16 @@ func NewEnnPolicy(
     k8siptablesInterface    utiliptables.Interface,
 )(*EnnPolicy, error){
 
-	syncPeriod    := config.PolicyPeriod
-	minSyncPeriod := config.MinSyncPeriod
-	iPRange       := config.IPRange
+	syncPeriod      := config.PolicyPeriod
+	minSyncPeriod   := config.MinSyncPeriod
+	iPRange         := config.IPRange
+	acceptFlannel   := config.AcceptFlannelIP
+	flannelNet      := config.FlannelNetwork
+	flannelLen, err := strconv.Atoi(config.FlannelLenBit)
+	if err != nil{
+		glog.Errorf("invalid flannelLen %s, err: %v, set this value to default number 8", config.FlannelLenBit, err)
+		flannelLen = 8
+	}
 
 	glog.V(4).Infof("start to build ennPolicy structure")
 	// check valid user input
@@ -125,7 +141,8 @@ func NewEnnPolicy(
 
 	clusterCIDR, err := utilpolicy.GetPodCidrFromNodeSpec(clientset,config.HostnameOverride)
 	if err != nil{
-		return nil, fmt.Errorf("NewEnnPolicy failure: GetPodCidr fall: %s", err.Error())
+		glog.Errorf("NewEnnPolicy failure: GetPodCidr fall: %s", err.Error())
+		clusterCIDR = ""
 	}
 	if len(clusterCIDR) == 0 {
 		glog.Warningf("clusterCIDR not specified, unable to distinguish between internal and external traffic")
@@ -145,6 +162,9 @@ func NewEnnPolicy(
 		nodeIP:                  nodeIP,
 		clusterCIDR:             clusterCIDR,
 		iPRange:                 iPRange,
+		acceptFlannel:           acceptFlannel,
+		flannelNet:              flannelNet,
+		flannelLen:              flannelLen,
 		networkPolicySynced:     false,
 		podSynced:               false,
 		namespaceSynced:         false,
@@ -165,6 +185,8 @@ func NewEnnPolicy(
 		namespacePodMap:         make(utilpolicy.NamespacePodMap),
 		namespaceInfoMap:        make(utilpolicy.NamespaceInfoMap),
 		activeIPSets:            make(map[string]*utilIPSet.IPSet),
+		podXLabelMap:            make(map[types.NamespacedName]*utilpolicy.NamespacedLabelMap),
+		podXLabelSet:            make(map[types.NamespacedName]*utilIPSet.IPSet),
 		podLabelSet:             make(map[utilpolicy.NamespacedLabel]*utilIPSet.IPSet),
 		namespacePodLabelSet:    make(map[utilpolicy.Label]*utilIPSet.IPSet),
 		namespacePodSet:         make(map[string]*utilIPSet.IPSet),
@@ -373,6 +395,13 @@ func (policy *EnnPolicy) syncEnnPolicy(syncType int){
 		return
 	}
 
+	// ensure ipset for flannel net
+	flannelNetSet, err := policy.ensureFlannelNetSet()
+	if err!= nil{
+		glog.Errorf("ensure ipset for flannel net %s error %v", policy.iPRange, err)
+		return
+	}
+
 	// ensure ipset for iPRange
 	iPRangeSet, err := policy.ensureIPRangeSet()
 	if err!= nil{
@@ -414,9 +443,17 @@ func (policy *EnnPolicy) syncEnnPolicy(syncType int){
 	case SYNCALL:
 		glog.V(4).Infof("syncType is SYNCALL, so sync all rules and check unused rule")
 		// no map changed so we need to sync the whole iptables rules and ipset rules
-		err := policy.initActiveIPSets(iPRangeSet)
+		err := policy.initActiveIPSets(iPRangeSet, flannelNetSet)
 		if err != nil{
 			glog.Errorf("init active IPSets failed %v", err)
+		}
+		err = policy.ensureIPRangeSetMember(iPRangeSet)
+		if err != nil{
+			glog.Errorf("ensure ip range member err %v", err)
+		}
+		err = policy.ensureFlannelNetSetMember(flannelNetSet)
+		if err != nil{
+			glog.Errorf("ensure flannel net member err %v", err)
 		}
 		err = policy.syncPolicyRules()
 		if err != nil{
@@ -437,7 +474,7 @@ func (policy *EnnPolicy) syncEnnPolicy(syncType int){
 		// so we also neet to sync ipset rules
 		// todo: better use incremental update
 		utilpolicy.UpdateNetworkPolicyMap(policy.networkPolicyMap, &policy.networkPolicyChanges)
-		err := policy.initActiveIPSets(iPRangeSet)
+		err := policy.initActiveIPSets(iPRangeSet, flannelNetSet)
 		if err != nil{
 			glog.Errorf("init active IPSets failed %v", err)
 		}
@@ -528,6 +565,168 @@ func (policy *EnnPolicy) ensureEnnEntry() error{
 	return nil
 }
 
+
+// insert ipset for ip range e.g:
+// Name: ENN-FLANNEL-xxxxxx
+// Type: hash:ip
+// Revision: 2
+// Header: family inet hashsize 1024 maxelem 65536
+// Size in memory: 448
+// References: 1
+// Members:
+// 10.244.0.0
+// 10.244.0.1
+func (policy *EnnPolicy) ensureFlannelNetSet() (*utilIPSet.IPSet, error){
+	glog.V(4).Infof("start to ensure flannel net ip set")
+	flannelNetName := ennFlannelIPSetName(policy.flannelNet, strconv.Itoa(policy.flannelLen))
+	flannelNetSet := &utilIPSet.IPSet{
+		Name:    flannelNetName,
+		Type:    utilIPSet.TypeHashIP,
+	}
+	err := policy.ipsetInterface.CreateIPSet(flannelNetSet, true)
+	if err!= nil{
+		return nil, fmt.Errorf("ensure flannelNetSet error %v", err)
+	}
+	return flannelNetSet, nil
+}
+
+func (policy *EnnPolicy) ensureFlannelNetSetMember(flannelNetSet *utilIPSet.IPSet) error{
+
+	if !policy.acceptFlannel{
+		glog.V(4).Infof("accept flannel is set to false, so skip ensure flannelNetSet members")
+		return nil
+	}
+
+	if policy.flannelLen > 32 || policy.flannelLen < 0 {
+		return fmt.Errorf("invalid flannelLen:%d", policy.flannelLen)
+	}
+
+	str := strings.Split(policy.flannelNet, "/")
+	if len(str) != 2{
+		return fmt.Errorf("invalid flannelNet:%s", policy.flannelNet)
+	}
+
+	// get flannel net ip
+	flannelIP   := str[0]
+	ips := strings.Split(flannelIP, ".")
+	if len(ips) != 4{
+		return fmt.Errorf("invalid flannelNet:%s", policy.flannelNet)
+	}
+	flannelIpsInt, err := utiltool.IpStringToInt(ips)
+	if err != nil{
+		return fmt.Errorf("invalid flannelNet:%s", policy.flannelNet)
+	}
+
+	// get flannel net sublen
+	flannelMask, err := strconv.Atoi(str[1])
+	if err != nil{
+		return fmt.Errorf("invalid flannelNet:%s", policy.flannelNet)
+	}
+	//flanelSubLen := 32 - flannelMask
+	dockerMask   := flannelMask + policy.flannelLen
+	if dockerMask > 32 || dockerMask < 0 {
+		return fmt.Errorf("invalid dockerMask, flannelNet:%s, flannelLen:%d", policy.flannelNet, policy.flannelLen)
+	}
+	dockerSubLen := 32 - dockerMask
+
+	// build flannel/docker ip map
+	// add all possible flannel ips and docker ips
+	// flannel ip end up with .0 and docker ip end up with .1
+	var item int
+	for item = 0; item * 8 <= dockerSubLen; item ++{}
+	item --
+	if item == 0{
+		return fmt.Errorf("dockerSubLen is less than 8: %d", dockerSubLen)
+	}
+	dockerBit := dockerSubLen - item * 8
+	step      := utiltool.PowerInt(2, dockerBit)
+	stepLimit := utiltool.PowerInt(2, policy.flannelLen)
+
+
+	flanelIPMap := make(map[string]bool)
+
+	for i := 0; i < stepLimit; i++{
+		// add flannel ip (end up with .0)
+		ipString, err := utiltool.IpIntToString(flannelIpsInt)
+		if err != nil{
+			fmt.Errorf("ensureFlannelNetSetMember: invalid ip err: %v", err)
+		} else {
+			flanelIPMap[ipString] = true
+		}
+		// add docker ip (end up with .1)
+		dockerIpsInt, err := utiltool.IpOperateAdd(flannelIpsInt, 0, 1)
+		if err != nil{
+			fmt.Errorf("ensureFlannelNetSetMember: ip add step error: %v", err)
+		} else {
+			ipString, err := utiltool.IpIntToString(dockerIpsInt)
+			if err != nil{
+				fmt.Errorf("ensureFlannelNetSetMember: invalid ip err: %v", err)
+			} else {
+				flanelIPMap[ipString] = true
+			}
+		}
+		// get next flannel ip
+		flannelIpsInt, err = utiltool.IpOperateAdd(flannelIpsInt, item, step)
+		if err != nil{
+			fmt.Errorf("ensureFlannelNetSetMember: ip add step error: %v", err)
+			break
+		}
+	}
+
+	kernelSet, err := policy.ipsetInterface.GetIPSet(flannelNetSet.Name)
+	if err!= nil{
+		return err
+	}
+	kernelEntries, err := policy.ipsetInterface.ListEntry(kernelSet)
+	if err!= nil{
+		return err
+	}
+
+	//delete unused entries
+	for _, kernelEntry := range kernelEntries{
+		glog.V(7).Infof("kernel entry is type:%s, ip:%s, port:%s, net:%s",
+			kernelEntry.Type, kernelEntry.IP, kernelEntry.Port, kernelEntry.Net)
+		ip, err := utilIPSet.EntryToString(kernelEntry)
+		if err!= nil{
+			glog.Errorf("get entry err ipset:%s, entry type:%s err:%v", kernelSet.Name, kernelEntry.Type, err)
+			continue
+		}
+		_, ok := flanelIPMap[ip]
+		if !ok{
+			glog.V(6).Infof("find unused entry %s of ipset %s:%s so delete it", ip, kernelSet.Name, kernelSet.Type)
+			err := policy.ipsetInterface.DelEntry(kernelSet, kernelEntry, false)
+			if err != nil{
+				glog.Errorf("ensureFlannelNetSetMember error : %v", err)
+				continue
+			}
+		}
+	}
+	// add new entries
+	kernelEntryIPMap := make(map[string]bool)
+	for _, kernelEntry := range kernelEntries{
+		kernelEntryIPMap[kernelEntry.IP] = true
+	}
+	for ip := range flanelIPMap{
+		glog.V(7).Infof("podInfoMap ip is %s", ip)
+		_, ok := kernelEntryIPMap[ip]
+		if !ok{
+			glog.V(6).Infof("find new entry %s of ipset %s:%s so add it", ip, kernelSet.Name, kernelSet.Type)
+			entry := &utilIPSet.Entry{
+				IP:    ip,
+				Type:  utilIPSet.TypeHashIP,
+			}
+			err := policy.ipsetInterface.AddEntry(kernelSet, entry, true)
+			if err != nil{
+				glog.Errorf("ensureFlannelNetSetMember error : %v", err)
+				continue
+			}
+		}
+	}
+
+
+	return nil
+}
+
 // insert ipset for ip range e.g:
 // Name: ENN-RANGEIP-xxxxxx
 // Type: hash:net
@@ -548,29 +747,35 @@ func (policy *EnnPolicy) ensureIPRangeSet() (*utilIPSet.IPSet, error){
 	if err!= nil{
 		return nil, fmt.Errorf("ensure IPRangeSet error %v", err)
 	}
-//	policy.activeIPSets[iPRangeSet.Name] = iPRangeSet
+	return iPRangeSet, nil
+}
+
+func (policy *EnnPolicy) ensureIPRangeSetMember(iPRangeSet *utilIPSet.IPSet) error{
 
 	entries, err := policy.ipsetInterface.ListEntry(iPRangeSet)
-
+	if err != nil{
+		return fmt.Errorf("ensure IPRangeSetMember error %v", err)
+	}
 	// delete unused entry for IPRangeSet
 	for _, entry := range entries{
 		net, err := utilIPSet.EntryToString(entry)
 		if err != nil{
-			return nil, fmt.Errorf("invalid IPRangeSet %v", err)
+			return fmt.Errorf("invalid IPRangeSet %v", err)
 		}
 		if strings.Compare(net, policy.iPRange) != 0{
 			glog.V(6).Infof("find unused entry: %s of ipset %s:%s so delete it", net, iPRangeSet.Name, iPRangeSet.Type)
 			err := policy.ipsetInterface.DelEntry(iPRangeSet, entry, false)
 			if err != nil{
-				return nil, fmt.Errorf("ensure IPRangeSet error %v", err)
+				return fmt.Errorf("ensure IPRangeSetMember error %v", err)
 			}
 		}
 	}
+
 	// add iPRange to IPRangeSet
 
 	if strings.Compare(policy.iPRange, "0.0.0.0/0") == 0{
 		glog.V(4).Infof("default ip range is 0.0.0.0/0, so skip add entry (ipset cannot handle 0.0.0.0/0)")
-		return iPRangeSet, nil
+		return nil
 	}
 
 	iPRangeEntry := &utilIPSet.Entry{
@@ -579,22 +784,26 @@ func (policy *EnnPolicy) ensureIPRangeSet() (*utilIPSet.IPSet, error){
 	}
 	err = policy.ipsetInterface.AddEntry(iPRangeSet, iPRangeEntry, true)
 	if err!= nil{
-		return nil, fmt.Errorf("ensure IPRangeSet  add entry error %v", err)
+		return fmt.Errorf("ensure IPRangeSet  add entry error %v", err)
 	}
-	return iPRangeSet, nil
+	return nil
 }
 
 // initActiveIPSets will init policy.activeIPSets
 // and add first ipset "ipRangeSet" into this map
 // this map will store ipsets which created by enn-policy
 // enn-policy will only sync ipsets which is "active"
-func (policy *EnnPolicy) initActiveIPSets(iPRangeSet *utilIPSet.IPSet) error{
+func (policy *EnnPolicy) initActiveIPSets(iPRangeSet, flannelNetSet *utilIPSet.IPSet) error{
 	// init activeIPSets
 	policy.activeIPSets = make(map[string]*utilIPSet.IPSet)
 	if iPRangeSet == nil{
 		return fmt.Errorf("ipRangeSet is nil")
 	}
-	policy.activeIPSets[iPRangeSet.Name] = iPRangeSet
+	if flannelNetSet == nil{
+		return fmt.Errorf("flannelNetSet is nil")
+	}
+	policy.activeIPSets[iPRangeSet.Name]    = iPRangeSet
+	policy.activeIPSets[flannelNetSet.Name] = flannelNetSet
 	return nil
 }
 
@@ -675,7 +884,12 @@ func (policy *EnnPolicy) syncPolicyRules() error{
 		policy.activeIPSets[namespaceIPSet.Name] = namespaceIPSet
 
 		// create ipset for corresponding policy podSelector (NetworkPolicy.spec.podSelector)
-		var policyPodSetNames []string
+		// var policyPodSetNames []string
+		var xLabel []string
+		specPodSelector := &utilpolicy.NamespacedLabelMap{
+			Namespace:  policyNamespace,
+			Label:      make(map[string]string),
+		}
 		for labelKey, labelValue := range networkPolicy.PodSelector{
 			glog.V(4).Infof("networkpolicy %s defined spec.podSelector %s=%s, so create ipset for the label", networkPolicy.Name, labelKey, labelValue)
 			policyPodSetName := ennLabelIPSetName(policyNamespace, "pod", labelKey, labelValue)
@@ -694,7 +908,7 @@ func (policy *EnnPolicy) syncPolicyRules() error{
 				)
 				continue
 			}
-			policyPodSetNames = append(policyPodSetNames, policyPodSetName)
+			// policyPodSetNames = append(policyPodSetNames, policyPodSetName)
 			namespacedLabel := utilpolicy.NamespacedLabel{
 				Namespace:   policyNamespace,
 				LabelKey:    labelKey,
@@ -705,6 +919,36 @@ func (policy *EnnPolicy) syncPolicyRules() error{
 			if !ok{
 				policy.podLabelSet[namespacedLabel] = policyIPSet
 			}
+			policy.activeIPSets[policyIPSet.Name] = policyIPSet
+
+			xLabel = append(xLabel, labelKey)
+			xLabel = append(xLabel, labelValue)
+			specPodSelector.Label[labelKey] = labelValue
+		}
+
+		// create podSelector ipset for policy spec, logic of matchLabels should be and
+		if len(networkPolicy.PodSelector) > 0 {
+			policyPodSetName := ennXLabelIPSetName(policyNamespace, "pod", xLabel)
+			policyIPSet := &utilIPSet.IPSet{
+				Name:    policyPodSetName,
+				Type:    utilIPSet.TypeHashIP,
+			}
+			err := policy.ipsetInterface.CreateIPSet(policyIPSet, true)
+			if err != nil{
+				glog.Errorf("networkPolicy %s:%s create ipset for policy spec podSelector",
+					policyName,
+					policyNamespace,
+					err,
+				)
+			}
+			policy.activeIPSets[policyIPSet.Name] = policyIPSet
+
+			namespaceName := types.NamespacedName{Namespace: policyNamespace, Name: policyName}
+
+			policy.podXLabelMap[namespaceName] = specPodSelector
+
+			policy.podXLabelSet[namespaceName] = policyIPSet
+
 			policy.activeIPSets[policyIPSet.Name] = policyIPSet
 		}
 
@@ -757,7 +1001,8 @@ func (policy *EnnPolicy) syncPolicyRules() error{
 				!strings.HasPrefix(chainString, "ENN-EGRESS-") &&
 				!strings.HasPrefix(chainString, "ENN-PLY-IN-") &&
 				!strings.HasPrefix(chainString, "ENN-PLY-E-") &&
-				!strings.HasPrefix(chainString, "ENN-DPATCH-"){
+				!strings.HasPrefix(chainString, "ENN-DPATCH-")&&
+				!strings.HasPrefix(chainString, "ENN-IPCIDR-"){
 				// Ignore chains that aren't ours.
 				continue
 			}
@@ -832,8 +1077,10 @@ func (policy *EnnPolicy) syncIngressRule(networkPolicy *utilpolicy.NetworkPolicy
 
 	// create iptables ingress policy rule for iPRange, like
 	// iptables -t filter -N ENN-PLY-IN-xxxxxx
+	// iptables -t filter -A ENN-INGRESS-xxxxxx -m set --match-set [flannelRnage] src -j ACCEPT
 	// iptables -t filter -A ENN-INGRESS-xxxxxx -m set --match-set [iPRange] src -j ENN-PLY-IN-xxxxxx
 	// iptables -t filter -A ENN-INGRESS-xxxxxx -j ACCEPT
+
 	glog.V(4).Infof("process iptables ingress policy rule for iPRange %s/ ", policy.iPRange)
 	iPRangeIngressChainName := ennIPRangeIngressChainName(networkPolicy.Namespace, policy.iPRange)
 	chainName = utiliptables.Chain(iPRangeIngressChainName)
@@ -849,6 +1096,18 @@ func (policy *EnnPolicy) syncIngressRule(networkPolicy *utilpolicy.NetworkPolicy
 	} else {
 
 		policy.activeFilterChains[chainName] = true
+		if policy.acceptFlannel{
+			glog.V(4).Infof("process iptables ingress policy rule for all flannel/docker ips: %s", policy.flannelNet)
+			flannelNetName := ennFlannelIPSetName(policy.flannelNet, strconv.Itoa(policy.flannelLen))
+			comment := fmt.Sprintf(`"match flannel ip net: %s"`, policy.flannelNet)
+			args = []string{
+				"-A", namespaceIngressChainName,
+				"-m", "set", "--match-set", flannelNetName, "src",
+				"-m", "comment", "--comment", comment,
+				"-j", "ACCEPT",
+			}
+			writeLine(policy.filterRules, args...)
+		}
 		if strings.Compare(policy.iPRange, "0.0.0.0/0") == 0 {
 			glog.V(4).Infof("iprange is default value 0.0.0.0/0 so derectly jump to iPRangeChain")
 			comment := fmt.Sprintf(`"iprange is default value %s so derectly jump to iPRangeChain"`, policy.iPRange)
@@ -884,7 +1143,7 @@ func (policy *EnnPolicy) syncIngressRule(networkPolicy *utilpolicy.NetworkPolicy
 		// no PodSelector and NamespaceSelector and CIDR defined
 		// which means ingress.spec is empty
 		// but if only ports defined, should apply rule for all ip with special ports
-		if len(ingress.PodSelector) == 0 && len(ingress.NamespaceSelector) == 0 && len(ingress.CIDR) == 0 {
+		if len(ingress.PodSelector) == 0 && len(ingress.NamespaceSelector) == 0 && len(ingress.IPBlock) == 0 {
 
 			if len(ingress.Ports) > 0 {
 				policy.dispatchOnlyPorts(
@@ -916,11 +1175,11 @@ func (policy *EnnPolicy) syncIngressRule(networkPolicy *utilpolicy.NetworkPolicy
 			)
 		}
 		// handle iptables rules for ipBlock
-		for _, cidr := range ingress.CIDR{
+		for _, ipBlock := range ingress.IPBlock{
 			policy.dispatchIPBlock(
 				TYPE_INGRESS,
 				networkPolicy,
-				cidr,
+				ipBlock,
 				ingress.Ports,
 				iPRangeIngressChainName,
 			)
@@ -968,8 +1227,10 @@ func (policy *EnnPolicy) syncEgressRule(networkPolicy *utilpolicy.NetworkPolicyI
 
 	// create iptables egress policy rule for iPRange, like
 	// iptables -t filter -N ENN-PLY-E-xxxxxx
+	// iptables -t filter -A ENN-INGRESS-xxxxxx -m set --match-set [flannelRnage] dst -j ACCEPT
 	// iptables -t filter -A ENN-EGRESS-xxxxxx -m set --match-set [iPRange] dst -j ENN-PLY-E-xxxxxx
 	// iptables -t filter -A ENN-EGRESS-xxxxxx -j ACCEPT
+
 	glog.V(4).Infof("process iptables egress policy rule for iPRange %s/ ", policy.iPRange)
 	iPRangeEgressChainName := ennIPRangeEgressChainName(networkPolicy.Namespace, policy.iPRange)
 	chainName = utiliptables.Chain(iPRangeEgressChainName)
@@ -985,6 +1246,18 @@ func (policy *EnnPolicy) syncEgressRule(networkPolicy *utilpolicy.NetworkPolicyI
 	} else {
 
 		policy.activeFilterChains[chainName] = true
+		if policy.acceptFlannel{
+			glog.V(4).Infof("process iptables egress policy rule for all flannel/docker ips: %s", policy.flannelNet)
+			flannelNetName := ennFlannelIPSetName(policy.flannelNet, strconv.Itoa(policy.flannelLen))
+			comment := fmt.Sprintf(`"match flannel ip net: %s"`, policy.flannelNet)
+			args = []string{
+				"-A", namespaceEgressChainName,
+				"-m", "set", "--match-set", flannelNetName, "dst",
+				"-m", "comment", "--comment", comment,
+				"-j", "ACCEPT",
+			}
+			writeLine(policy.filterRules, args...)
+		}
 		if strings.Compare(policy.iPRange, "0.0.0.0/0") == 0 {
 			glog.V(4).Infof("iprange is default value 0.0.0.0/0 so derectly jump to iPRangeChain")
 			comment := fmt.Sprintf(`"iprange is default value %s so derectly jump to iPRangeChain"`, policy.iPRange)
@@ -1020,7 +1293,7 @@ func (policy *EnnPolicy) syncEgressRule(networkPolicy *utilpolicy.NetworkPolicyI
 		// no PodSelector and NamespaceSelector and CIDR defined
 		// which means egress.spec is empty
 		// but if only ports defined, should apply rule for all ip with special ports
-		if len(egress.PodSelector) == 0 && len(egress.NamespaceSelector) == 0 && len(egress.CIDR) == 0 {
+		if len(egress.PodSelector) == 0 && len(egress.NamespaceSelector) == 0 && len(egress.IPBlock) == 0 {
 
 			if len(egress.Ports) > 0 {
 				policy.dispatchOnlyPorts(
@@ -1052,11 +1325,11 @@ func (policy *EnnPolicy) syncEgressRule(networkPolicy *utilpolicy.NetworkPolicyI
 			)
 		}
 		// handle iptables rules for ipBlock
-		for _, cidr := range egress.CIDR{
+		for _, ipBlock := range egress.IPBlock{
 			policy.dispatchIPBlock(
 				TYPE_EGRESS,
 				networkPolicy,
-				cidr,
+				ipBlock,
 				egress.Ports,
 				iPRangeEgressChainName,
 			)
@@ -1107,9 +1380,13 @@ func (policy *EnnPolicy) dispatchOnlyPorts( ruleType         int,
 	}
 	policy.activeFilterChains[chainName] = true
 
+	comment := fmt.Sprintf(`"policy %s:%s entry for only ports"`,
+		networkPolicy.Namespace,
+		networkPolicy.Name,
+	)
 	args = []string{
 		"-A", iPRangeChainName,
-		"-m", "comment", "--comment", `"entry for only ports"`,
+		"-m", "comment", "--comment", comment,
 	}
 	writeLine(policy.filterRules, append(args, "-j", dispatchChainName)...)
 
@@ -1134,19 +1411,25 @@ func (policy *EnnPolicy) dispatchOnlyPorts( ruleType         int,
 			}
 			writeLine(policy.filterRules, args...)
 
-		}
-		// if spec.podSelector is defined, so create rule match pods src with labels
-		for labelKey, labelValue := range networkPolicy.PodSelector{
-			glog.V(4).Infof("accept rule selected by network policy %s/%s: %s match %s=%s",
-				networkPolicy.Namespace, networkPolicy.Name, policyPodMatchDirect, labelKey, labelValue)
-			comment := fmt.Sprintf(`"accept rule selected by policy %s/%s: %s match %s=%s"`,
+		} else {
+			// if spec.podSelector is defined, so create rule match pods src with labels
+			var xLabel []string
+			for labelKey, labelValue := range networkPolicy.PodSelector {
+				glog.V(4).Infof("accept rule selected by network policy %s/%s: %s match %s=%s",
+					networkPolicy.Namespace, networkPolicy.Name, policyPodMatchDirect, labelKey, labelValue)
+
+				xLabel = append(xLabel, labelKey)
+				xLabel = append(xLabel, labelValue)
+
+			}
+
+			comment := fmt.Sprintf(`"accept rule selected by policy %s/%s: %s match policy spec podSelector"`,
 				networkPolicy.Namespace,
 				networkPolicy.Name,
 				policyPodMatchDirect,
-				labelKey,
-				labelValue,
 			)
-			policyPodSetName := ennLabelIPSetName(networkPolicy.Namespace, "pod", labelKey, labelValue)
+
+			policyPodSetName := ennXLabelIPSetName(networkPolicy.Namespace, "pod", xLabel)
 
 			args = []string{
 				"-A", dispatchChainName,
@@ -1157,7 +1440,6 @@ func (policy *EnnPolicy) dispatchOnlyPorts( ruleType         int,
 				"-j", "ACCEPT",
 			}
 			writeLine(policy.filterRules, args...)
-
 		}
 	}
 }
@@ -1203,8 +1485,8 @@ func (policy *EnnPolicy) dispatchPodSelector(ruleType         int,
 		err := policy.ipsetInterface.CreateIPSet(selectPodIPSet, true)
 		if err != nil{
 			glog.Errorf("networkPolicy %s:%s create ipset for podSelector pod match %s=%s err %v",
-				networkPolicy.Name,
 				networkPolicy.Namespace,
+				networkPolicy.Name,
 				podLabelKey,
 				podLabelValue,
 				err,
@@ -1242,9 +1524,13 @@ func (policy *EnnPolicy) dispatchPodSelector(ruleType         int,
 		}
 		policy.activeFilterChains[chainName] = true
 
+		comment := fmt.Sprintf(`"policy %s:%s entry for podSelector"`,
+			networkPolicy.Namespace,
+			networkPolicy.Name,
+		)
 		args = []string{
 			"-A", iPRangeChainName,
-			"-m", "comment", "--comment", `"entry for podSelector"`,
+			"-m", "comment", "--comment", comment,
 		}
 		writeLine(policy.filterRules, append(args, "-j", dispatchChainName)...)
 
@@ -1284,24 +1570,31 @@ func (policy *EnnPolicy) dispatchPodSelector(ruleType         int,
 				writeLine(policy.filterRules, args...)
 
 			}
-		}
-		// spec.podSelector is defined, so create rule match selected dst pods for ingress, match selected src pods for egress
-		for policyLabelKey, policyLabelValue := range networkPolicy.PodSelector{
-			glog.V(4).Infof("accept rule selected by network policy %s/%s: %s match %s=%s",
-				networkPolicy.Namespace, networkPolicy.Name, policyPodMatchDirect, policyLabelKey, policyLabelValue)
-			comment := fmt.Sprintf(`"accept rule selected by policy %s/%s: %s match %s=%s, %s pod match %s=%s"`,
+		} else {
+			// spec.podSelector is defined, so create rule match selected dst pods for ingress, match selected src pods for egress
+			var xLabel []string
+			for policyLabelKey, policyLabelValue := range networkPolicy.PodSelector {
+				glog.V(4).Infof("accept rule selected by network policy %s/%s: %s match %s=%s",
+					networkPolicy.Namespace, networkPolicy.Name, policyPodMatchDirect, policyLabelKey, policyLabelValue)
+
+				xLabel = append(xLabel, policyLabelKey)
+				xLabel = append(xLabel, policyLabelValue)
+
+			}
+
+			comment := fmt.Sprintf(`"accept rule selected by policy %s/%s: %s match spec podSelector, %s pod match %s=%s"`,
 				networkPolicy.Namespace,
 				networkPolicy.Name,
 				policyPodMatchDirect,
-				policyLabelKey,
-				policyLabelValue,
 				selectPodMatchDirect,
 				podLabelKey,
 				podLabelValue,
 			)
-			policyPodSetName := ennLabelIPSetName(networkPolicy.Namespace, "pod", policyLabelKey, policyLabelValue)
+
+			policyPodSetName := ennXLabelIPSetName(networkPolicy.Namespace, "pod", xLabel)
+
 			// Ports is not defined
-			if len(Ports) == 0{
+			if len(Ports) == 0 {
 
 				args = []string{
 					"-A", dispatchChainName,
@@ -1313,7 +1606,7 @@ func (policy *EnnPolicy) dispatchPodSelector(ruleType         int,
 				writeLine(policy.filterRules, args...)
 
 			}
-			for _, port := range Ports{
+			for _, port := range Ports {
 
 				args = []string{
 					"-A", dispatchChainName,
@@ -1371,8 +1664,8 @@ func (policy *EnnPolicy) dispatchNamespaceSelector(ruleType         int,
 		err := policy.ipsetInterface.CreateIPSet(selectPodIPSet, true)
 		if err != nil{
 			glog.Errorf("networkPolicy %s:%s create ipset for namespaceSelector match %s=%s err %v",
-				networkPolicy.Name,
 				networkPolicy.Namespace,
+				networkPolicy.Name,
 				namespaceLabelKey,
 				namespaceLabelValue,
 				err,
@@ -1410,9 +1703,13 @@ func (policy *EnnPolicy) dispatchNamespaceSelector(ruleType         int,
 		}
 		policy.activeFilterChains[chainName] = true
 
+		comment := fmt.Sprintf(`"policy %s:%s entry for namespaceSelector"`,
+			networkPolicy.Namespace,
+			networkPolicy.Name,
+		)
 		args = []string{
 			"-A", iPRangeChainName,
-			"-m", "comment", "--comment", `"entry for namespaceSelector"`,
+			"-m", "comment", "--comment", comment,
 		}
 		writeLine(policy.filterRules, append(args, "-j", dispatchChainName)...)
 
@@ -1452,24 +1749,31 @@ func (policy *EnnPolicy) dispatchNamespaceSelector(ruleType         int,
 				writeLine(policy.filterRules, args...)
 
 			}
-		}
-		// spec.podSelector is defined, so create rule match selected dst pods for ingress, match selected src pods for egress
-		for policyLabelKey, policyLabelValue := range networkPolicy.PodSelector{
-			glog.V(4).Infof("accept rule selected by network policy %s/%s: %s match %s=%s",
-				networkPolicy.Namespace, networkPolicy.Name, policyPodMatchDirect, policyLabelKey, policyLabelValue)
-			comment := fmt.Sprintf(`"accept rule selected by policy %s/%s: %s match %s=%s, %s namespace match %s=%s"`,
+		} else {
+			// spec.podSelector is defined, so create rule match selected dst pods for ingress, match selected src pods for egress
+			var xLabel []string
+			for policyLabelKey, policyLabelValue := range networkPolicy.PodSelector {
+				glog.V(4).Infof("accept rule selected by network policy %s/%s: %s match %s=%s",
+					networkPolicy.Namespace, networkPolicy.Name, policyPodMatchDirect, policyLabelKey, policyLabelValue)
+
+				xLabel = append(xLabel, policyLabelKey)
+				xLabel = append(xLabel, policyLabelValue)
+
+			}
+
+			comment := fmt.Sprintf(`"accept rule selected by policy %s/%s: %s match policy spec podSelector, %s namespace match %s=%s"`,
 				networkPolicy.Namespace,
 				networkPolicy.Name,
 				policyPodMatchDirect,
-				policyLabelKey,
-				policyLabelValue,
 				selectPodMatchDirect,
 				namespaceLabelKey,
 				namespaceLabelValue,
 			)
-			policyPodSetName := ennLabelIPSetName(networkPolicy.Namespace, "pod", policyLabelKey, policyLabelValue)
+
+			policyPodSetName := ennXLabelIPSetName(networkPolicy.Namespace, "pod", xLabel)
+
 			// Ports is not defined
-			if len(Ports) == 0{
+			if len(Ports) == 0 {
 
 				args = []string{
 					"-A", dispatchChainName,
@@ -1481,7 +1785,7 @@ func (policy *EnnPolicy) dispatchNamespaceSelector(ruleType         int,
 				writeLine(policy.filterRules, args...)
 
 			}
-			for _, port := range Ports{
+			for _, port := range Ports {
 
 				args = []string{
 					"-A", dispatchChainName,
@@ -1504,7 +1808,7 @@ func (policy *EnnPolicy) dispatchNamespaceSelector(ruleType         int,
 // for egress rule, iptables will accept traffic to corresponding selected cidr
 func (policy *EnnPolicy) dispatchIPBlock(ruleType         int,
                                          networkPolicy    *utilpolicy.NetworkPolicyInfo,
-                                         cidr             string,
+                                         ipBlock          utilpolicy.CIDRRange,
                                          Ports            []utilpolicy.PolicyPort,
                                          iPRangeChainName string,
 ) {
@@ -1527,16 +1831,23 @@ func (policy *EnnPolicy) dispatchIPBlock(ruleType         int,
 	}
 
 	glog.V(4).Infof("network olicy %s/%s NetworkPolicyPeer IPBlock CIDR %s",
-		networkPolicy.Namespace, networkPolicy.Name, cidr)
+		networkPolicy.Namespace, networkPolicy.Name, ipBlock.CIDR)
 	// create dispatch iptables rule
 	dispatchChainName := ennDispatchChainName(
 		networkPolicy.Namespace,
 		networkPolicy.Name,
 		strconv.Itoa(ruleType),
 		"ipBlock",
-		cidr,
+		ipBlock.CIDR,
 		"",
 		"",
+	)
+
+	ipBlockChainName := ennIPBlockChainName(
+		networkPolicy.Namespace,
+		networkPolicy.Name,
+		strconv.Itoa(ruleType),
+		ipBlock.CIDR,
 	)
 
 	chainName := utiliptables.Chain(dispatchChainName)
@@ -1547,9 +1858,22 @@ func (policy *EnnPolicy) dispatchIPBlock(ruleType         int,
 	}
 	policy.activeFilterChains[chainName] = true
 
+
+	chainName = utiliptables.Chain(ipBlockChainName)
+	if chain, ok := policy.existingFilterChains[chainName]; ok {
+		writeLine(policy.filterChains, chain)
+	} else {
+		writeLine(policy.filterChains, utiliptables.MakeChainLine(chainName))
+	}
+	policy.activeFilterChains[chainName] = true
+
+	comment := fmt.Sprintf(`"policy %s:%s entry for ipBlock"`,
+		networkPolicy.Namespace,
+		networkPolicy.Name,
+	)
 	args = []string{
 		"-A", iPRangeChainName,
-		"-m", "comment", "--comment", `"entry for ipBlock"`,
+		"-m", "comment", "--comment", comment,
 	}
 	writeLine(policy.filterRules, append(args, "-j", dispatchChainName)...)
 
@@ -1561,15 +1885,15 @@ func (policy *EnnPolicy) dispatchIPBlock(ruleType         int,
 			networkPolicy.Namespace,
 			networkPolicy.Name,
 			cidrDirect,
-			cidr,
+			ipBlock.CIDR,
 		)
 		// Ports is not defined
 		if len(Ports) == 0{
 			args = []string{
 				"-A", dispatchChainName,
 				"-m", "comment", "--comment", comment,
-				cidrDirect, cidr,
-				"-j", "ACCEPT",
+				cidrDirect, ipBlock.CIDR,
+				"-j", ipBlockChainName,
 			}
 			writeLine(policy.filterRules, args...)
 
@@ -1578,54 +1902,135 @@ func (policy *EnnPolicy) dispatchIPBlock(ruleType         int,
 			args = []string{
 				"-A", dispatchChainName,
 				"-m", "comment", "--comment", comment,
-				cidrDirect, cidr,
+				cidrDirect, ipBlock.CIDR,
 				"-p", port.Protocol,
 				"--dport", port.Port,
-				"-j", "ACCEPT",
+				"-j", ipBlockChainName,
 			}
 			writeLine(policy.filterRules, args...)
 		}
-	}
-	// spec.podSelector is defined, so create rule match selected dst pods for ingress, match selected src pods for egress
-	for policyLabelKey, policyLabelValue := range networkPolicy.PodSelector{
-		glog.V(4).Infof("accept rule selected by network policy %s/%s: %s match %s=%s",
-			networkPolicy.Namespace, networkPolicy.Name, policyPodMatchDirect, policyLabelKey, policyLabelValue)
-		comment := fmt.Sprintf(`"accept rule selected by policy %s/%s: %s match %s=%s, %s cidr %s"`,
+	} else {
+		// spec.podSelector is defined, so create rule match selected dst pods for ingress, match selected src pods for egress
+		var xLabel []string
+		for policyLabelKey, policyLabelValue := range networkPolicy.PodSelector {
+			glog.V(4).Infof("accept rule selected by network policy %s/%s: %s match %s=%s",
+				networkPolicy.Namespace, networkPolicy.Name, policyPodMatchDirect, policyLabelKey, policyLabelValue)
+
+			xLabel = append(xLabel, policyLabelKey)
+			xLabel = append(xLabel, policyLabelValue)
+
+		}
+
+		comment := fmt.Sprintf(`"accept rule selected by policy %s/%s: %s match policy spec podSelector, %s cidr %s"`,
 			networkPolicy.Namespace,
 			networkPolicy.Name,
 			policyPodMatchDirect,
-			policyLabelKey,
-			policyLabelValue,
 			cidrDirect,
-			cidr,
+			ipBlock.CIDR,
 		)
-		policyPodSetName := ennLabelIPSetName(networkPolicy.Namespace, "pod", policyLabelKey, policyLabelValue)
+
+		policyPodSetName := ennXLabelIPSetName(networkPolicy.Namespace, "pod", xLabel)
+
 		// Ports is not defined
-		if len(Ports) == 0{
+		if len(Ports) == 0 {
 			args = []string{
 				"-A", dispatchChainName,
 				"-m", "comment", "--comment", comment,
 				"-m", "set", "--match-set", policyPodSetName, policyPodMatchDirect,
-				cidrDirect, cidr,
-				"-j", "ACCEPT",
+				cidrDirect, ipBlock.CIDR,
+				"-j", ipBlockChainName,
 			}
 			writeLine(policy.filterRules, args...)
 
 		}
-		for _, port := range Ports{
+		for _, port := range Ports {
 			args = []string{
 				"-A", dispatchChainName,
 				"-m", "comment", "--comment", comment,
 				"-m", "set", "--match-set", policyPodSetName, policyPodMatchDirect,
-				cidrDirect, cidr,
+				cidrDirect, ipBlock.CIDR,
 				"-p", port.Protocol,
 				"--dport", port.Port,
-				"-j", "ACCEPT",
+				"-j", ipBlockChainName,
 			}
 			writeLine(policy.filterRules, args...)
 
 		}
 	}
+
+	policy.handleIPBlockChain(ruleType, networkPolicy, ipBlock, ipBlockChainName)
+}
+
+func (policy *EnnPolicy) handleIPBlockChain(ruleType         int,
+                                            networkPolicy    *utilpolicy.NetworkPolicyInfo,
+                                            ipBlock          utilpolicy.CIDRRange,
+                                            ipBlockChainName string,
+) {
+	glog.V(4).Infof("process handle IPBlock cidr rules for networkPolicy %s/%s ", networkPolicy.Namespace, networkPolicy.Name)
+	var args []string
+
+	var cidrDirect string
+	if ruleType == TYPE_INGRESS{
+		cidrDirect = "src"
+		glog.V(4).Infof("cidr ingress policy rules")
+	} else if ruleType == TYPE_EGRESS{
+		cidrDirect = "dst"
+		glog.V(4).Infof("cidr egress policy rules")
+	} else {
+		glog.Errorf("invalid ruleType %d", ruleType)
+		return
+	}
+
+	// create corresponding ipset for except cidr
+	exceptCIDRSetName := ennExceptCIDRIPSetName(networkPolicy.Namespace, networkPolicy.Name, strconv.Itoa(ruleType), ipBlock.CIDR)
+	exceptCIDRIPSet := &utilIPSet.IPSet{
+		Name:    exceptCIDRSetName,
+		Type:    utilIPSet.TypeHashNet,
+	}
+	err := policy.ipsetInterface.CreateIPSet(exceptCIDRIPSet, true)
+	if err != nil{
+		glog.Errorf("networkPolicy %s:%s create ipset for except cidr: %s err: %v",
+			networkPolicy.Namespace,
+			networkPolicy.Name,
+			ipBlock.CIDR,
+			err,
+		)
+		return
+	}
+
+	policy.activeIPSets[exceptCIDRIPSet.Name] = exceptCIDRIPSet
+
+	err = policy.syncIPSetEntryForNet(exceptCIDRIPSet, ipBlock.ExceptCIDR)
+	if err != nil{
+		glog.Errorf("sync cidr ipset: %s err: %v", exceptCIDRSetName, err)
+	}
+
+	// create corresponding iptables rule
+	comment := fmt.Sprintf(`"reject rule selected by policy %s/%s: %s excpet cidr"`,
+		networkPolicy.Namespace,
+		networkPolicy.Name,
+		cidrDirect,
+	)
+
+	args = []string{
+		"-A", ipBlockChainName,
+		"-m", "comment", "--comment", comment,
+		"-m", "set", "--match-set", exceptCIDRSetName, cidrDirect,
+		"-j", "REJECT",
+	}
+
+	writeLine(policy.filterRules, args...)
+
+	comment = fmt.Sprintf(`"accept default traffic of cidr %s"`, ipBlock.CIDR)
+
+	args = []string{
+		"-A", ipBlockChainName,
+		"-m", "comment", "--comment", comment,
+		"-j", "ACCEPT",
+	}
+
+	writeLine(policy.filterRules, args...)
+
 }
 
 // syncAllPodSets will sync all the ipsets defined in networkPolicy
@@ -1699,6 +2104,75 @@ func (policy *EnnPolicy) syncAllPodSets() error{
 		}
 	}
 
+	// sync ipset entry for spec podSelector
+	for namespacedName, ipset := range policy.podXLabelSet{
+
+		namespacedLabelMap, ok := policy.podXLabelMap[namespacedName]
+		if !ok{
+			glog.Errorf("cannot find namepacedLabelMap for namespaceName %s:%s", namespacedName.Namespace, namespacedName.Name)
+			continue
+		}
+
+		labelLen := len(namespacedLabelMap.Label)
+		// if spec podSelector is not defined, skip
+		if labelLen == 0{
+			continue
+		}
+		var podInfoMaps []utilpolicy.PodInfoMap
+		podInfoMaps = make([]utilpolicy.PodInfoMap, labelLen)
+
+		podInfoMapLen := 0
+		for key, value := range namespacedLabelMap.Label{
+			namespacedLabel := utilpolicy.NamespacedLabel{
+				Namespace:   namespacedLabelMap.Namespace,
+				LabelKey:    key,
+				LabelValue:  value,
+			}
+			xPodInfoMap, ok := policy.podMatchLabelMap[namespacedLabel]
+			// maybe some key/value pairs are invalid
+			if !ok{
+				glog.Errorf("cannot find any pod in namespace %s label %s=%s",
+					namespacedLabel.Namespace,
+					namespacedLabel.LabelKey,
+					namespacedLabel.LabelValue,
+				)
+			} else {
+				podInfoMaps[podInfoMapLen] = make(utilpolicy.PodInfoMap)
+				for ip, infoMap := range xPodInfoMap{
+					podInfoMaps[podInfoMapLen][ip] = infoMap
+				}
+				podInfoMapLen++
+			}
+		}
+		// there is no valid key/value pairs for this ipset, so skip
+		if podInfoMapLen == 0{
+			glog.Errorf("invalid spec.podSelector for namespaceName %s:%s",namespacedName.Namespace, namespacedName.Name)
+			continue
+		}
+
+		// AND operation for podInfoMaps
+		podInfoMap := podInfoMaps[0]
+		for i := 1; i < podInfoMapLen; i++{
+			for ip := range podInfoMap{
+				_, ok := podInfoMaps[i][ip]
+				if !ok{
+					delete(podInfoMap, ip)
+				}
+			}
+		}
+
+		err := policy.syncIPSetEntry(ipset, podInfoMap)
+		if err != nil{
+			glog.Errorf("sync entry for ipset:%s of namespaceName %s:%s failed %s",
+				ipset.Name,
+				namespacedName.Namespace,
+				namespacedName.Name,
+				err,
+			)
+		}
+
+	}
+
 	return nil
 }
 
@@ -1720,11 +2194,13 @@ func (policy *EnnPolicy) syncPodSets() error{
 				continue
 			}
 			policy.trySyncPodLabelSet(namespacedLabel)
+			policy.trySyncPodXLabelSet(namespacedLabel)
 
 		}
 		for namespacedLabel, _ := range podSetChange.Current{
 
 			policy.trySyncPodLabelSet(namespacedLabel)
+			policy.trySyncPodXLabelSet(namespacedLabel)
 		}
 	}
 
@@ -1914,6 +2390,171 @@ func (policy *EnnPolicy) syncIPSetEntry(ipset *utilIPSet.IPSet, podInfoMap utilp
 	}
 
 	return nil
+}
+
+func (policy *EnnPolicy) syncIPSetEntryForNet(ipset *utilIPSet.IPSet, nets []string) error{
+
+
+	glog.V(4).Infof("start to sync entry for ipset %s:%s", ipset.Name, ipset.Type)
+	kernelSet, err := policy.ipsetInterface.GetIPSet(ipset.Name)
+	if err!= nil{
+		return err
+	}
+	kernelEntries, err := policy.ipsetInterface.ListEntry(kernelSet)
+	if err!= nil{
+		return err
+	}
+
+	netsMap := make(map[string]bool)
+	for _, net := range nets{
+		netsMap[net] = true
+	}
+	kernelEntryIPMap := make(map[string]bool)
+	for _, kernelEntry := range kernelEntries{
+		kernelEntryIPMap[kernelEntry.Net] = true
+	}
+
+	//delete unused entries
+	for _, kernelEntry := range kernelEntries{
+		glog.V(7).Infof("kernel entry is type:%s, ip:%s, port:%s, net:%s",
+			kernelEntry.Type, kernelEntry.IP, kernelEntry.Port, kernelEntry.Net)
+		net, err := utilIPSet.EntryToString(kernelEntry)
+		if err!= nil{
+			glog.Errorf("get entry err ipset:%s, entry type:%s err:%v", kernelSet.Name, kernelEntry.Type, err)
+			continue
+		}
+		_, ok := netsMap[net]
+		if !ok{
+			glog.V(6).Infof("find unused entry: %s of ipset %s:%s so delete it", net, kernelSet.Name, kernelSet.Type)
+			err := policy.ipsetInterface.DelEntry(kernelSet, kernelEntry, false)
+			if err != nil{
+				glog.Errorf("syncIPSetEntry error : %v", err)
+				continue
+			}
+		}
+	}
+
+	// add new entries
+	for net := range netsMap{
+		glog.V(7).Infof("new hash/net is %s", net)
+		_, ok := kernelEntryIPMap[net]
+		if !ok{
+			glog.V(6).Infof("find new entry: %s of ipset %s:%s so add it", net, kernelSet.Name, kernelSet.Type)
+			entry := &utilIPSet.Entry{
+				Net:   net,
+				Type:  utilIPSet.TypeHashNet,
+			}
+			err := policy.ipsetInterface.AddEntry(kernelSet, entry, true)
+			if err != nil{
+				glog.Errorf("syncIPSetEntry error : %v", err)
+				continue
+			}
+		}
+	}
+
+	return nil
+}
+
+// trySyncPodXLabelSet will try sync ipset entries with given namespacedLabel
+// when a pod is added/deleted/updated, trySyncPodXLabelSet will scan the whole podXLabelMap
+// and find whether there is a namespacedLabelMap item contains corresponding namespacedLabel
+// if find a item, sync corresponding ipset
+func (policy *EnnPolicy) trySyncPodXLabelSet(namespaceLabel utilpolicy.NamespacedLabel){
+
+	glog.V(4).Infof("try to sync PodXLabelSet for namespacedLabel %s:%s=%s", namespaceLabel.Namespace, namespaceLabel.LabelKey, namespaceLabel.LabelValue)
+
+	// scan all podXLabelMap to find namespacedLabelMap contains namespacedLabel(namespaceLabel.Namespace/namespaceLabel.LabelKey/namespaceLabel.LabelValue)
+	for namespacedName, namespacedLabelMap := range policy.podXLabelMap{
+
+		if strings.Compare(namespacedLabelMap.Namespace, namespaceLabel.Namespace) == 0{
+			containLabel := false
+			for key, value := range namespacedLabelMap.Label{
+				if strings.Compare(key,namespaceLabel.LabelKey) == 0 && strings.Compare(value,namespaceLabel.LabelValue) == 0{
+
+					containLabel = true
+					break;
+
+				}
+			}
+
+			if !containLabel{
+				continue
+			}
+
+			// 1. if find, we should get the ipset name
+			ipset, ok := policy.podXLabelSet[namespacedName]
+			if !ok{
+				glog.Errorf("trySyncPodXLabelSet: cannot find podXLabelSet for namespaceName %s:%s",
+					namespacedName.Namespace,
+					namespacedName.Name,
+				)
+				continue
+			}
+
+			// check whether ipset is active, delete inactive ipset from corresponding map
+			_, ok = policy.activeIPSets[ipset.Name]
+			if !ok{
+				glog.V(6).Infof("ipset: %s is not active, so delete this ipset from podXLabelSet", ipset.Name)
+				delete(policy.podXLabelSet, namespacedName)
+				continue
+			}
+
+			// 2. get the podInfoMaps for each namespacedLabel
+			labelLen := len(namespacedLabelMap.Label)
+			// if spec podSelector is not defined, skip
+			if labelLen == 0{
+				continue
+			}
+			var podInfoMaps []utilpolicy.PodInfoMap
+			podInfoMaps = make([]utilpolicy.PodInfoMap, labelLen)
+
+			podInfoMapLen := 0
+			for key, value := range namespacedLabelMap.Label{
+				namespacedLabel := utilpolicy.NamespacedLabel{
+					Namespace:   namespacedLabelMap.Namespace,
+					LabelKey:    key,
+					LabelValue:  value,
+				}
+				xPodInfoMap, ok := policy.podMatchLabelMap[namespacedLabel]
+				// maybe some key/value pairs are invalid
+				if !ok{
+					glog.Errorf("trySyncPodXLabelSet: cannot find any pod in namespace %s label %s=%s",
+						namespacedLabel.Namespace,
+						namespacedLabel.LabelKey,
+						namespacedLabel.LabelValue,
+					)
+				} else {
+					podInfoMaps[podInfoMapLen] = make(utilpolicy.PodInfoMap)
+					for ip, infoMap := range xPodInfoMap{
+						podInfoMaps[podInfoMapLen][ip] = infoMap
+					}
+					podInfoMapLen++
+				}
+			}
+
+			// 3. AND operation for podInfoMaps
+			podInfoMap := podInfoMaps[0]
+			for i := 1; i < podInfoMapLen; i++{
+				for ip := range podInfoMap{
+					_, ok := podInfoMaps[i][ip]
+					if !ok{
+						delete(podInfoMap, ip)
+					}
+				}
+			}
+
+			// 4. sync corresponding ipset
+			err := policy.syncIPSetEntry(ipset, podInfoMap)
+			if err != nil{
+				glog.Errorf("trySyncPodXLabelSet: sync entry for ipset:%s of namespaceName %s:%s failed %s",
+					ipset.Name,
+					namespacedName.Namespace,
+					namespacedName.Name,
+					err,
+				)
+			}
+		}
+	}
 }
 
 // trySyncPodLabelSet will try sync ipset entries with given namespaceLabel
@@ -2123,6 +2764,15 @@ func (policy *EnnPolicy) checkUnusedIPSets() error{
 		if !ok{
 			glog.V(4).Infof("find inavtive ipset:%s in namespacePodSet so delete it", ipsetName)
 			delete(policy.namespacePodSet, namespace)
+		}
+	}
+
+	for namespacedName, ipset := range policy.podXLabelSet{
+		ipsetName := ipset.Name
+		_, ok := policy.activeIPSets[ipsetName]
+		if !ok{
+			glog.V(4).Infof("find inavtive ipset:%s in podXLabelSet so delete it", ipsetName)
+			delete(policy.podXLabelSet, namespacedName)
 		}
 	}
 
@@ -2381,6 +3031,12 @@ func ennDispatchChainName(namespace string, policyName string, inORe string, mat
 	return "ENN-DPATCH-" + encoded[:16]
 }
 
+func ennIPBlockChainName(namespace string, policyName string, inORe string, cidr string) string{
+	hash := sha256.Sum256([]byte(namespace + policyName + inORe + cidr))
+	encoded := base32.StdEncoding.EncodeToString(hash[:])
+	return "ENN-IPCIDR-" + encoded[:16]
+}
+
 func ennNamespaceIPSetName(namespace string) string{
 	hash := sha256.Sum256([]byte(namespace))
 	encoded := base32.StdEncoding.EncodeToString(hash[:])
@@ -2400,10 +3056,36 @@ func ennLabelIPSetName(namespace string, kind string, labelKey string, labelValu
 	return "ENN-PODSET-" + encoded[:16]
 }
 
+// ipset name for possible flannel ips and docker ips
+func ennFlannelIPSetName(flannelNet string, flannelLen string) string{
+	hash := sha256.Sum256([]byte(flannelNet + flannelLen))
+	encoded := base32.StdEncoding.EncodeToString(hash[:])
+	return "ENN-FLANNEL-" + encoded[:16]
+}
+
+// [kind] separate namespacedLabel from different kind (pod/namespace)
+// [labels] should come in pairs (key/value)
+func ennXLabelIPSetName(namespace string, kind string, labels []string) string{
+	sort.Strings(labels)
+	var xLabel = ""
+	for _, label := range labels{
+		xLabel += label
+	}
+	hash := sha256.Sum256([]byte(namespace + kind + xLabel))
+	encoded := base32.StdEncoding.EncodeToString(hash[:])
+	return "ENN-PODSET-" + encoded[:16]
+}
+
 func ennNSLabelIPSetName(labelKey string, labelValue string) string{
 	hash := sha256.Sum256([]byte(labelKey + labelValue))
 	encoded := base32.StdEncoding.EncodeToString(hash[:])
 	return "ENN-NSSET-" + encoded[:16]
+}
+
+func ennExceptCIDRIPSetName(namespace string, policyName string, inORe string, cidr string) string{
+	hash := sha256.Sum256([]byte(namespace + policyName + inORe + cidr))
+	encoded := base32.StdEncoding.EncodeToString(hash[:])
+	return "ENN-IPTSET-" + encoded[:16]
 }
 
 // Join all words with spaces, terminate with newline and write to buf.
@@ -2418,3 +3100,4 @@ func writeLine(buf *bytes.Buffer, words ...string) {
 		}
 	}
 }
+

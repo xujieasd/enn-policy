@@ -16,6 +16,12 @@ test:
 	hack/test.sh
 	@echo "enn-policy unit test finished."
 
+.PHONY: kernel_test
+kernel_test:
+	@echo "enn-policy all unit test Starting."
+	hack/kernel_test.sh
+	@echo "enn-policy all unit test finished."
+
 .PHONY: clean
 clean:
 	rm -f enn-policy

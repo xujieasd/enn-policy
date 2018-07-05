@@ -66,17 +66,23 @@ func (e *EnnIPTables) Prepend(table, chain string, pos int, rulespec ...string) 
 }
 
 // PrependUnique acts like Prepend except that it won't add a duplicate
+// need to ensure that iptables rules must be always inserted at the first place of the chain
 func (e *EnnIPTables) PrependUnique(table, chain string, rulespec ...string) error {
 	exists, err := e.IPTablesHandle.Exists(table, chain, rulespec...)
 	if err != nil {
 		return err
 	}
-	if !exists {
-		err := e.IPTablesHandle.Insert(table, chain, 1, rulespec...)
+	if exists {
+		err := e.IPTablesHandle.Delete(table, chain, rulespec...)
 		if err != nil{
-			return fmt.Errorf("iptables prependUnique chain %s to tables %s err %s", chain, table, err.Error())
+			return err
 		}
 	}
+	err = e.IPTablesHandle.Insert(table, chain, 1, rulespec...)
+	if err != nil{
+		return fmt.Errorf("iptables prependUnique chain %s to tables %s err %s", chain, table, err.Error())
+	}
+
 	return nil
 }
 

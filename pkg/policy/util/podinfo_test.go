@@ -338,30 +338,36 @@ func TestPodInfoAdd(t *testing.T){
 		makeTestPod(podNamespace[0], podName[0], func(pod *api.Pod) {
 			pod.Labels = label1
 			pod.Status.PodIP = podIP[0]
+			pod.Status.Conditions = []api.PodCondition{{Type: api.PodReady, Status: api.ConditionTrue}}
 		}),
 		// single pod muti label
 		makeTestPod(podNamespace[1], podName[1], func(pod *api.Pod) {
 			pod.Labels = label2
 			pod.Status.PodIP = podIP[1]
+			pod.Status.Conditions = []api.PodCondition{{Type: api.PodReady, Status: api.ConditionTrue}}
 		}),
 		// different namespace with same label
 		makeTestPod(podNamespace[2], podName[2], func(pod *api.Pod) {
 			pod.Labels = label2
 			pod.Status.PodIP = podIP[2]
+			pod.Status.Conditions = []api.PodCondition{{Type: api.PodReady, Status: api.ConditionTrue}}
 		}),
 		// add new pod to exist namespace, same label
 		makeTestPod(podNamespace[0], podName[3], func(pod *api.Pod) {
 			pod.Labels = label1
 			pod.Status.PodIP = podIP[3]
+			pod.Status.Conditions = []api.PodCondition{{Type: api.PodReady, Status: api.ConditionTrue}}
 		}),
 		// add new pod to exist namespace, different label
 		makeTestPod(podNamespace[0], podName[4], func(pod *api.Pod) {
 			pod.Labels = label4
 			pod.Status.PodIP = podIP[4]
+			pod.Status.Conditions = []api.PodCondition{{Type: api.PodReady, Status: api.ConditionTrue}}
 		}),
 		makeTestPod(podNamespace[2], podName[5], func(pod *api.Pod) {
 			pod.Labels = label1
 			pod.Status.PodIP = podIP[5]
+			pod.Status.Conditions = []api.PodCondition{{Type: api.PodReady, Status: api.ConditionTrue}}
 		}),
 	}
 
@@ -754,31 +760,37 @@ func TestPodInfoAddDelete(t *testing.T){
 		makeTestPod(podNamespace[0], podName[0], func(pod *api.Pod) {
 			pod.Labels = label1
 			pod.Status.PodIP = podIP[0]
+			pod.Status.Conditions = []api.PodCondition{{Type: api.PodReady, Status: api.ConditionTrue}}
 		}),
 		// 1 single pod muti label
 		makeTestPod(podNamespace[1], podName[1], func(pod *api.Pod) {
 			pod.Labels = label2
 			pod.Status.PodIP = podIP[1]
+			pod.Status.Conditions = []api.PodCondition{{Type: api.PodReady, Status: api.ConditionTrue}}
 		}),
 		// 2 different namespace with same label
 		makeTestPod(podNamespace[2], podName[2], func(pod *api.Pod) {
 			pod.Labels = label2
 			pod.Status.PodIP = podIP[2]
+			pod.Status.Conditions = []api.PodCondition{{Type: api.PodReady, Status: api.ConditionTrue}}
 		}),
 		// 3 add new pod to exist namespace, same label
 		makeTestPod(podNamespace[0], podName[3], func(pod *api.Pod) {
 			pod.Labels = label1
 			pod.Status.PodIP = podIP[3]
+			pod.Status.Conditions = []api.PodCondition{{Type: api.PodReady, Status: api.ConditionTrue}}
 		}),
 		// 4 add new pod to exist namespace, different label
 		makeTestPod(podNamespace[0], podName[4], func(pod *api.Pod) {
 			pod.Labels = label4
 			pod.Status.PodIP = podIP[4]
+			pod.Status.Conditions = []api.PodCondition{{Type: api.PodReady, Status: api.ConditionTrue}}
 		}),
 		// 5
 		makeTestPod(podNamespace[2], podName[5], func(pod *api.Pod) {
 			pod.Labels = label1
 			pod.Status.PodIP = podIP[5]
+			pod.Status.Conditions = []api.PodCondition{{Type: api.PodReady, Status: api.ConditionTrue}}
 		}),
 	}
 
@@ -1054,26 +1066,31 @@ func TestPodInfoUpdate(t *testing.T){
 		makeTestPod(podNamespace[0], podName[0], func(pod *api.Pod) {
 			pod.Labels = label0
 			pod.Status.PodIP = podIP[0]
+			pod.Status.Conditions = []api.PodCondition{{Type: api.PodReady, Status: api.ConditionTrue}}
 		}),
 		//1
 		makeTestPod(podNamespace[1], podName[1], func(pod *api.Pod) {
 			pod.Labels = label2
 			pod.Status.PodIP = podIP[1]
+			pod.Status.Conditions = []api.PodCondition{{Type: api.PodReady, Status: api.ConditionTrue}}
 		}),
 		//2
 		makeTestPod(podNamespace[0], podName[2], func(pod *api.Pod) {
 			pod.Labels = label1
 			pod.Status.PodIP = podIP[2]
+			pod.Status.Conditions = []api.PodCondition{{Type: api.PodReady, Status: api.ConditionTrue}}
 		}),
 		//3
 		makeTestPod(podNamespace[0], podName[0], func(pod *api.Pod) {
 			pod.Labels = label1
 			pod.Status.PodIP = podIP[0]
+			pod.Status.Conditions = []api.PodCondition{{Type: api.PodReady, Status: api.ConditionTrue}}
 		}),
 		//4
 		makeTestPod(podNamespace[0], podName[0], func(pod *api.Pod) {
 			pod.Labels = label2
 			pod.Status.PodIP = podIP[0]
+			pod.Status.Conditions = []api.PodCondition{{Type: api.PodReady, Status: api.ConditionTrue}}
 		}),
 	}
 

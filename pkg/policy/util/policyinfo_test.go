@@ -97,6 +97,7 @@ func TestNetworkPolicyMapAdd(t *testing.T){
 					From: []api.NetworkPolicyPeer{{
 						IPBlock: &api.IPBlock{
 							CIDR: "172.10.2.0/16",
+							Except: []string{"172.10.3.0/24","172.10.4.0/24"},
 						},
 					}},
 				},
@@ -140,6 +141,7 @@ func TestNetworkPolicyMapAdd(t *testing.T){
 					To: []api.NetworkPolicyPeer{{
 						IPBlock: &api.IPBlock{
 							CIDR: "198.168.2.0/24",
+							Except: []string{"198.168.3.0/32","198.168.4.0/32"},
 						},
 					}},
 				},
@@ -247,7 +249,7 @@ func TestNetworkPolicyMapMultiAdd(t *testing.T){
 					From: []api.NetworkPolicyPeer{{
 						PodSelector: &metav1.LabelSelector{MatchLabels: label1},
 						NamespaceSelector: &metav1.LabelSelector{MatchLabels: label2},
-						IPBlock: &api.IPBlock{CIDR: "198.168.2.0/24"},
+						IPBlock: &api.IPBlock{CIDR: "198.168.2.0/24", Except: []string{"198.168.3.0/32","198.168.4.0/32"}},
 					}},
 					Ports: []api.NetworkPolicyPort{{
 						Protocol: &protocolTCP,
@@ -260,7 +262,7 @@ func TestNetworkPolicyMapMultiAdd(t *testing.T){
 					To: []api.NetworkPolicyPeer{{
 						PodSelector: &metav1.LabelSelector{MatchLabels: label3},
 						NamespaceSelector: &metav1.LabelSelector{MatchLabels: label4},
-						IPBlock: &api.IPBlock{CIDR: "198.168.1.0/24"},
+						IPBlock: &api.IPBlock{CIDR: "198.168.1.0/24", Except: []string{"198.168.5.0/32","198.168.6.0/32"},},
 					}},
 					Ports: []api.NetworkPolicyPort{{
 						Protocol: &protocolTCP,
@@ -284,7 +286,7 @@ func TestNetworkPolicyMapMultiAdd(t *testing.T){
 				},
 				{
 					To: []api.NetworkPolicyPeer{{
-						IPBlock: &api.IPBlock{CIDR: "198.168.1.0/24"},
+						IPBlock: &api.IPBlock{CIDR: "198.168.1.0/24", Except: []string{"198.168.3.0/32","198.168.4.0/32"},},
 					}},
 				},
 				{
@@ -747,13 +749,13 @@ func checkNetworkPolicyValid(t *testing.T, npMap NetworkPolicyMap, networkPolicy
 						specIngressRule := networkPolicy.Spec.Ingress[indexIngress]
 						indexPod           := len(ingress.PodSelector)
 						indexNamespace     := len(ingress.NamespaceSelector)
-						indexCIDR          := len(ingress.CIDR)
+						indexCIDR          := len(ingress.IPBlock)
 						tempIndexPod       := 0
 						tempIndexNamespace := 0
 						tempIndexCIDR      := 0
 
 						if len(specIngressRule.Ports)!=len(ingress.Ports){
-							t.Errorf("invalid port length %d, expect %d", len(ingress.Ports), (specIngressRule.Ports))
+							t.Errorf("invalid port length %d, expect %d", len(ingress.Ports), len(specIngressRule.Ports))
 							return false
 						}
 						for indexPort, specPorts := range specIngressRule.Ports{
@@ -798,10 +800,29 @@ func checkNetworkPolicyValid(t *testing.T, npMap NetworkPolicyMap, networkPolicy
 									t.Errorf("invalid IPBlock index expect %d len %d", tempIndexCIDR, indexCIDR)
 									return false
 								}
-								cidr := ingress.CIDR[tempIndexCIDR]
+								ipBlock := ingress.IPBlock[tempIndexCIDR]
+								cidr := ipBlock.CIDR
+								except := ipBlock.ExceptCIDR
 								if strings.Compare(specPeer.IPBlock.CIDR, cidr) != 0{
 									t.Errorf("IPBlock.CIDR is not equal %s, expect %s", specPeer.IPBlock.CIDR, cidr)
 									return false
+								}
+								exceptMap := make(map[string]bool)
+								specExceptMap := make(map[string]bool)
+								for _, net := range except{
+									exceptMap[net] = true
+								}
+								for _, net := range specPeer.IPBlock.Except{
+									specExceptMap[net] = true
+								}
+								if !reflect.DeepEqual(exceptMap, specExceptMap){
+									t.Errorf("ipBlock except is not equeal")
+									for _, net := range except{
+										t.Errorf("get net: %s", net)
+									}
+									for _, net := range specPeer.IPBlock.Except{
+										t.Errorf("expect net: %s", net)
+									}
 								}
 								tempIndexCIDR ++
 							}
@@ -830,13 +851,13 @@ func checkNetworkPolicyValid(t *testing.T, npMap NetworkPolicyMap, networkPolicy
 						specEgressRule := networkPolicy.Spec.Egress[indexEgress]
 						indexPod           := len(egress.PodSelector)
 						indexNamespace     := len(egress.NamespaceSelector)
-						indexCIDR          := len(egress.CIDR)
+						indexCIDR          := len(egress.IPBlock)
 						tempIndexPod       := 0
 						tempIndexNamespace := 0
 						tempIndexCIDR      := 0
 
 						if len(specEgressRule.Ports)!=len(egress.Ports){
-							t.Errorf("invalid port length %d, expect %d", len(egress.Ports), (specEgressRule.Ports))
+							t.Errorf("invalid port length %d, expect %d", len(egress.Ports), len(specEgressRule.Ports))
 							return false
 						}
 						for indexPort, specPorts := range specEgressRule.Ports{
@@ -882,10 +903,29 @@ func checkNetworkPolicyValid(t *testing.T, npMap NetworkPolicyMap, networkPolicy
 									t.Errorf("invalid IPBlock index expect %d max %d", tempIndexCIDR, indexCIDR)
 									return false
 								}
-								cidr := egress.CIDR[tempIndexCIDR]
+								ipBlock := egress.IPBlock[tempIndexCIDR]
+								cidr := ipBlock.CIDR
+								except := ipBlock.ExceptCIDR
 								if strings.Compare(specPeer.IPBlock.CIDR, cidr) != 0{
 									t.Errorf("IPBlock.CIDR is not equal %s, expect %s", specPeer.IPBlock.CIDR, cidr)
 									return false
+								}
+								exceptMap := make(map[string]bool)
+								specExceptMap := make(map[string]bool)
+								for _, net := range except{
+									exceptMap[net] = true
+								}
+								for _, net := range specPeer.IPBlock.Except{
+									specExceptMap[net] = true
+								}
+								if !reflect.DeepEqual(exceptMap, specExceptMap){
+									t.Errorf("ipBlock except is not equeal")
+									for _, net := range except{
+										t.Errorf("get net: %s", net)
+									}
+									for _, net := range specPeer.IPBlock.Except{
+										t.Errorf("expect net: %s", net)
+									}
 								}
 								tempIndexCIDR ++
 							}

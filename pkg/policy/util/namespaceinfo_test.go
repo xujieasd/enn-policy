@@ -809,7 +809,7 @@ func checkAllNamespaceMapValid(t *testing.T,
 func checkNamespaceInfoMapValid(t *testing.T, niMap, expectedNIMap NamespaceInfoMap) bool{
 
 	if len(niMap) != len(expectedNIMap){
-		t.Errorf("length of NamespaceInfoMap is not correct %d, expected %s", len(niMap), len(expectedNIMap))
+		t.Errorf("length of NamespaceInfoMap is not correct %d, expected %d", len(niMap), len(expectedNIMap))
 		for name := range niMap{
 			t.Errorf("name of namespaceInfoMap: %s", name)
 		}

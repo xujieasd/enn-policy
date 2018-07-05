@@ -22,10 +22,11 @@ import (
 	"os"
 	"os/signal"
 	"syscall"
+	"net"
 )
 
-const Version    = "0.6"
-const LastUpdate = "2018.4.11"
+const Version    = "0.67"
+const LastUpdate = "2018.6.1"
 
 type EnnPolicyServer struct {
 	Policy                     *ennPolicy.EnnPolicy
@@ -75,15 +76,20 @@ func NewEnnPolicyServerDefault(config *options.EnnPolicyConfig)(*EnnPolicyServer
 		panic(err.Error())
 	}
 
+	var hostname string
+	var nodeIP   net.IP
 	node, err := policyUtil.GetNode(clientset,config.HostnameOverride)
 	if err != nil{
-		return nil, fmt.Errorf("NewEnnPolicy failure: GetNode fall: %s", err.Error())
-	}
-	hostname := node.Name
+		glog.Errorf("NewEnnPolicy failure: GetNode fall: %s", err.Error())
+		hostname = ""
+		nodeIP = nil
 
-	nodeIP, err := policyUtil.InternalGetNodeHostIP(node)
-	if err != nil{
-		return nil, fmt.Errorf("NewEnnPolicy failure: GetNodeIP fall: %s", err.Error())
+	} else {
+		hostname = node.Name
+		nodeIP, err = policyUtil.InternalGetNodeHostIP(node)
+		if err != nil{
+			glog.Errorf("NewEnnPolicy failure: GetNodeIP fall: %s", err.Error())
+		}
 	}
 
 	execerInterface := utilexec.New()
@@ -98,9 +104,6 @@ func NewEnnPolicyServerDefault(config *options.EnnPolicyConfig)(*EnnPolicyServer
 	dbus = utildbus.New()
 	k8siptInterface = utiliptables.New(execerInterface, dbus, protocol)
 
-	if err != nil {
-		return nil, fmt.Errorf("iptable init failed %s" + err.Error())
-	}
 	policy, err := ennPolicy.NewEnnPolicy(
 		clientset,
 		config,
